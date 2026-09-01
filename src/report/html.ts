@@ -134,7 +134,7 @@ const CLIENT_JS = `
 
   // ---------------------------------------------------------------- SVG ring diagram
   function ring(nodes, edges, failing, width) {
-    var n = nodes.length; var W = width || 380; var R = Math.max(70, Math.min(150, 40 + n * 18)); var H = R * 2 + 70;
+    var n = nodes.length; var W = width || 420; var R = Math.max(70, Math.min(150, 40 + n * 18)); var H = R * 2 + 70;
     var cx = W / 2, cy = H / 2; var pos = {};
     nodes.forEach(function (node, i) { var a = -Math.PI / 2 + (2 * Math.PI * i) / n; pos[node] = { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) }; });
     var colors = { eager: 'var(--eager)', deferred: 'var(--deferred)', type: 'var(--type)', none: 'var(--none)' };
@@ -154,9 +154,14 @@ const CLIENT_JS = `
       var mx = (x1 + x2) / 2, my = (y1 + y2) / 2; var bend = n === 2 ? 40 : 18;
       var cxp = mx - uy * bend, cyp = my + ux * bend;
       s += '<path d="M' + x1 + ',' + y1 + ' Q' + cxp + ',' + cyp + ' ' + x2 + ',' + y2 + '" fill="none" stroke="' + col + '" stroke-width="' + (isFail ? 3 : e.usage === 'eager' ? 2 : 1.5) + '" ' + (e.usage === 'type' || e.usage === 'none' ? 'stroke-dasharray="4 3" ' : '') + 'marker-end="url(#m-' + (isFail ? 'fail' : (colors[e.usage] ? e.usage : 'none')) + ')"><title>' + esc(e.from + ' → ' + e.to + ' { ' + e.symbols.join(', ') + ' } ' + usageLabel(e.usage)) + '</title></path>';
-      var lx = (x1 + 2 * cxp + x2) / 4, ly = (y1 + 2 * cyp + y2) / 4;
-      var label = (isFail ? '⚡ ' : '') + e.symbols.slice(0, 2).join(', ') + (e.symbols.length > 2 ? ' +' + (e.symbols.length - 2) : '');
-      s += '<text class="lbl" x="' + lx + '" y="' + ly + '" text-anchor="middle" style="' + (isFail ? 'fill:var(--critical);font-weight:700' : '') + '">' + esc(label) + '</text>';
+      // Label sits outside the curve (further along the bend direction) so opposite edges never overlap.
+      var off = bend * (n === 2 ? 1.7 : 1.4) + 8;
+      var lx = mx - uy * off, ly = my + ux * off;
+      var anchor2 = Math.abs(lx - cx) < 12 ? 'middle' : lx < cx ? 'end' : 'start';
+      var label = e.symbols.slice(0, 2).join(', ') + (e.symbols.length > 2 ? ' +' + (e.symbols.length - 2) : '');
+      if (label.length > 22) label = label.slice(0, 20) + '…';
+      if (isFail) label = '⚡ ' + label;
+      s += '<text class="lbl" x="' + lx + '" y="' + (ly + 3) + '" text-anchor="' + anchor2 + '" style="' + (isFail ? 'fill:var(--critical);font-weight:700' : '') + '"><title>' + esc(e.symbols.join(', ')) + '</title>' + esc(label) + '</text>';
     });
     nodes.forEach(function (node) {
       var p = pos[node]; var isFailNode = failing.some(function (f) { return f.from === node; });
