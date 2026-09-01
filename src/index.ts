@@ -1,0 +1,13 @@
+export { analyze, countBySeverity, severityRank } from './analyze.js';
+export type { AnalyzeProgress } from './analyze.js';
+export { resolveConfig, type CircdepsOptions, type ResolvedConfig } from './config.js';
+export { renderTextReport, type TextReportOptions } from './report/text.js';
+export { renderHtmlReport } from './report/html.js';
+export { toJsonReport, type JsonReport, type JsonFinding } from './report/json.js';
+export { parseModule, type ParseContext } from './parser.js';
+export { buildGraph, resolveExport, runtimeEdges, edgeSymbols } from './graph.js';
+export { ModuleResolver } from './resolver.js';
+export { Evaluator, evaluateAll } from './evaluate.js';
+export { buildDiGraph, findDiCycles } from './di.js';
+export * from './cycles.js';
+export type * from './types.js';
