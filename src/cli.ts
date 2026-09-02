@@ -185,6 +185,11 @@ const isDirectRun = (): boolean => {
 };
 
 if (isDirectRun()) {
+  // `circdeps | head` closes stdout early; that is not an error worth a stack trace.
+  process.stdout.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EPIPE') process.exit(process.exitCode ?? 0);
+    throw err;
+  });
   runCli(process.argv.slice(2)).then(
     (code) => {
       process.exitCode = code;
