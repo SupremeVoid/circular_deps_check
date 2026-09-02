@@ -75,8 +75,8 @@ main { padding: 20px 28px 60px; max-width: 1400px; margin: 0 auto; }
 .tag.ok { color: var(--ok); }
 details { margin-top: 8px; }
 summary { cursor: pointer; color: var(--accent); font-weight: 600; font-size: 13px; }
-.grid2 { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: 18px; align-items: start; margin-top: 10px; }
-@media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+.grid2 { display: grid; grid-template-columns: minmax(340px, 560px) 1fr; gap: 18px; align-items: start; margin-top: 10px; }
+@media (max-width: 1000px) { .grid2 { grid-template-columns: 1fr; } }
 .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 12px 0 6px; font-weight: 700; }
 .failure { background: var(--code); border-radius: 8px; padding: 10px 12px; margin: 6px 0; border: 1px solid var(--border); }
 .failure .loc { font-weight: 600; }
@@ -94,8 +94,9 @@ tr.fail td { background: color-mix(in srgb, var(--critical) 10%, transparent); }
 .sugg { margin: 4px 0; padding-left: 4px; }
 .sugg .v { color: var(--ok); font-weight: 700; } .sugg .u { color: var(--medium); font-weight: 700; }
 .sugg .details { color: var(--muted); font-size: 12.5px; margin-left: 20px; }
-svg text { font-size: 11px; fill: var(--text); }
+svg text { font-size: 11px; fill: var(--text); paint-order: stroke; stroke: var(--panel); stroke-width: 3px; stroke-linejoin: round; }
 svg .lbl { font-size: 10px; fill: var(--muted); }
+svg .node-lbl { font-size: 11px; }
 .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 6px; }
 .legend span::before { content: ""; display: inline-block; width: 18px; height: 3px; margin-right: 5px; vertical-align: middle; border-radius: 2px; background: currentColor; }
 .group { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 18px; margin-bottom: 12px; box-shadow: var(--shadow); }
@@ -134,9 +135,19 @@ const CLIENT_JS = `
 
   // ---------------------------------------------------------------- SVG ring diagram
   function ring(nodes, edges, failing, width) {
-    var n = nodes.length; var W = width || 420; var R = Math.max(70, Math.min(150, 40 + n * 18)); var H = R * 2 + 70;
+    // Layout: nodes on a ring; edges bend outward; edge labels sit on the ring between the two
+    // nodes they connect, file names sit further out. Everything radial, so labels never meet.
+    var n = nodes.length; var R = Math.max(90, Math.min(160, 60 + n * 14));
+    var W = width || 2 * (R + 175); var H = 2 * (R + 78);
     var cx = W / 2, cy = H / 2; var pos = {};
     nodes.forEach(function (node, i) { var a = -Math.PI / 2 + (2 * Math.PI * i) / n; pos[node] = { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) }; });
+    var showAll = n <= 8;
+    function trunc(t, max) { return t.length > max ? t.slice(0, max - 1) + '…' : t; }
+    function place(x, y) { // text anchor + baseline from the position relative to the centre
+      var anchor = Math.abs(x - cx) < 14 ? 'middle' : x < cx ? 'end' : 'start';
+      var dy = Math.abs(x - cx) < 14 ? (y < cy ? -4 : 12) : 4;
+      return { anchor: anchor, dy: dy };
+    }
     var colors = { eager: 'var(--eager)', deferred: 'var(--deferred)', type: 'var(--type)', none: 'var(--none)' };
     var s = '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" style="max-width:' + W + 'px;display:block;margin:auto">';
     s += '<defs>';
@@ -151,25 +162,33 @@ const CLIENT_JS = `
       var dx = b.x - a.x, dy = b.y - a.y, len = Math.sqrt(dx * dx + dy * dy) || 1;
       var ux = dx / len, uy = dy / len; var pad = 22;
       var x1 = a.x + ux * pad, y1 = a.y + uy * pad, x2 = b.x - ux * pad, y2 = b.y - uy * pad;
-      var mx = (x1 + x2) / 2, my = (y1 + y2) / 2; var bend = n === 2 ? 40 : 18;
-      var cxp = mx - uy * bend, cyp = my + ux * bend;
+      var mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+      // Outward direction: radial from the centre through the chord midpoint. For two nodes the
+      // midpoint is the centre, so fall back to the edge's perpendicular (opposite for each direction).
+      var rx = mx - cx, ry = my - cy, rl = Math.sqrt(rx * rx + ry * ry);
+      var ox, oy;
+      if (n === 2 || rl < 1) { ox = -uy; oy = ux; } else { ox = rx / rl; oy = ry / rl; }
+      var bend = n === 2 ? 44 : Math.max(14, (R - rl) * 0.9);
+      var cxp = mx + ox * bend, cyp = my + oy * bend;
       s += '<path d="M' + x1 + ',' + y1 + ' Q' + cxp + ',' + cyp + ' ' + x2 + ',' + y2 + '" fill="none" stroke="' + col + '" stroke-width="' + (isFail ? 3 : e.usage === 'eager' ? 2 : 1.5) + '" ' + (e.usage === 'type' || e.usage === 'none' ? 'stroke-dasharray="4 3" ' : '') + 'marker-end="url(#m-' + (isFail ? 'fail' : (colors[e.usage] ? e.usage : 'none')) + ')"><title>' + esc(e.from + ' → ' + e.to + ' { ' + e.symbols.join(', ') + ' } ' + usageLabel(e.usage)) + '</title></path>';
-      // Label sits outside the curve (further along the bend direction) so opposite edges never overlap.
-      var off = bend * (n === 2 ? 1.7 : 1.4) + 8;
-      var lx = mx - uy * off, ly = my + ux * off;
-      var anchor2 = Math.abs(lx - cx) < 12 ? 'middle' : lx < cx ? 'end' : 'start';
-      var label = e.symbols.slice(0, 2).join(', ') + (e.symbols.length > 2 ? ' +' + (e.symbols.length - 2) : '');
-      if (label.length > 22) label = label.slice(0, 20) + '…';
+      if (!showAll && !isFail && e.usage !== 'eager') return; // big rings: only the labels that matter
+      // Label just outside the curve's apex (the apex is at the quadratic's t=0.5 point).
+      var ax = (x1 + 2 * cxp + x2) / 4, ay = (y1 + 2 * cyp + y2) / 4;
+      var lx = ax + ox * 10, ly = ay + oy * 10;
+      var pl = place(lx, ly);
+      var label = trunc(e.symbols.slice(0, 2).join(', ') + (e.symbols.length > 2 ? ' +' + (e.symbols.length - 2) : ''), 24);
       if (isFail) label = '⚡ ' + label;
-      s += '<text class="lbl" x="' + lx + '" y="' + (ly + 3) + '" text-anchor="' + anchor2 + '" style="' + (isFail ? 'fill:var(--critical);font-weight:700' : '') + '"><title>' + esc(e.symbols.join(', ')) + '</title>' + esc(label) + '</text>';
+      s += '<text class="lbl" x="' + lx + '" y="' + (ly + pl.dy) + '" text-anchor="' + pl.anchor + '" style="' + (isFail ? 'fill:var(--critical);font-weight:700' : '') + '"><title>' + esc(e.symbols.join(', ')) + '</title>' + esc(label) + '</text>';
     });
     nodes.forEach(function (node) {
       var p = pos[node]; var isFailNode = failing.some(function (f) { return f.from === node; });
       var isBarrel = edges.some(function (e) { return e.to === node && e.viaBarrel; });
       s += '<g><circle cx="' + p.x + '" cy="' + p.y + '" r="16" fill="var(--panel)" stroke="' + (isFailNode ? 'var(--critical)' : isBarrel ? 'var(--barrel)' : 'var(--muted)') + '" stroke-width="' + (isFailNode ? 3 : 1.5) + '"><title>' + esc(node) + '</title></circle>';
-      var anchor = p.x < cx - 5 ? 'end' : p.x > cx + 5 ? 'start' : 'middle';
-      var tx = p.x + (anchor === 'end' ? -20 : anchor === 'start' ? 20 : 0), ty = p.y + (anchor === 'middle' ? (p.y < cy ? -22 : 30) : 4);
-      s += '<text x="' + tx + '" y="' + ty + '" text-anchor="' + anchor + '"><title>' + esc(node) + '</title>' + esc(base(node)) + '</text></g>';
+      // File name radially outside the node, beyond the edge labels.
+      var nx = (p.x - cx) / R, ny = (p.y - cy) / R;
+      var tx = p.x + nx * 44, ty = p.y + ny * 44;
+      var np = place(tx, ty);
+      s += '<text class="node-lbl" x="' + tx + '" y="' + (ty + np.dy) + '" text-anchor="' + np.anchor + '" style="' + (isFailNode ? 'font-weight:700' : '') + '"><title>' + esc(node) + '</title>' + esc(trunc(/^index\.[cm]?tsx?$/.test(base(node)) ? short(node) : base(node), 28)) + '</text></g>';
     });
     s += '</svg>';
     return s;
