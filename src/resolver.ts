@@ -23,10 +23,22 @@ export class ModuleResolver {
     private readonly fileSet: Set<string>,
     private readonly root: string,
   ) {
+    // Memoised host: TypeScript probes many candidate paths per import (extensions, index files,
+    // package.json lookups while walking up node_modules); on large projects these stats dominate.
+    const fileExists = new Map<string, boolean>();
+    const dirExists = new Map<string, boolean>();
+    const memo = (cache: Map<string, boolean>, fn: (p: string) => boolean) => (p: string): boolean => {
+      let v = cache.get(p);
+      if (v === undefined) {
+        v = fn(p);
+        cache.set(p, v);
+      }
+      return v;
+    };
     this.host = {
-      fileExists: (f) => ts.sys.fileExists(f),
+      fileExists: memo(fileExists, (f) => ts.sys.fileExists(f)),
       readFile: (f) => ts.sys.readFile(f),
-      directoryExists: (d) => ts.sys.directoryExists(d),
+      directoryExists: memo(dirExists, (d) => ts.sys.directoryExists(d)),
       getCurrentDirectory: () => root,
       getDirectories: (d) => ts.sys.getDirectories(d),
       realpath: ts.sys.realpath,
@@ -40,7 +52,11 @@ export class ModuleResolver {
   }
 
   resolve(specifier: string, containingFile: string): ResolveResult {
-    const key = `${path.dirname(containingFile)}\0${specifier}`;
+    // Bare specifiers (packages, tsconfig `paths` aliases) resolve independently of the importing
+    // directory in practice (baseUrl/paths, hoisted node_modules), so cache them once globally.
+    // Relative specifiers are cached per directory.
+    const relative = specifier.startsWith('.') || specifier.startsWith('/');
+    const key = relative ? `${path.dirname(containingFile)}\0${specifier}` : `\0${specifier}`;
     const cached = this.cache.get(key);
     if (cached) return cached;
 

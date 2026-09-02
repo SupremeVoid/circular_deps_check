@@ -1,0 +1,96 @@
+{
+  "seed": 42,
+  "filesArg": 3000,
+  "fileCount": 2951,
+  "generator": "scripts/generate-large-fixture.ts",
+  "cycles": {
+    "critical-extends": {
+      "kind": "runtime-break",
+      "severity": "critical",
+      "from": "src/app/shared/list/list-item.component.ts",
+      "to": "src/app/shared/base/base-list.component.ts",
+      "symbol": "BaseListComponent",
+      "files": [
+        "src/app/shared/list/list-item.component.ts",
+        "src/app/shared/base/base-list.component.ts",
+        "src/app/shared/list/index.ts"
+      ]
+    },
+    "critical-decorator": {
+      "kind": "runtime-break",
+      "severity": "critical",
+      "from": "src/app/shared/tree/tree-node.component.ts",
+      "to": "src/app/shared/tree/tree.component.ts",
+      "symbol": "TreeComponent",
+      "files": [
+        "src/app/shared/tree/tree.component.ts",
+        "src/app/shared/tree/tree-node.component.ts"
+      ]
+    },
+    "di-cycle": {
+      "kind": "di-cycle",
+      "severity": "high",
+      "files": [
+        "src/app/core/session.service.ts",
+        "src/app/core/profile.service.ts"
+      ],
+      "services": [
+        "SessionService",
+        "ProfileService"
+      ]
+    },
+    "latent": {
+      "kind": "latent-cycle",
+      "severity": "medium",
+      "from": "src/app/shared/models/defaults.ts",
+      "to": "src/app/shared/models/status.enum.ts",
+      "symbol": "Status",
+      "files": [
+        "src/app/shared/models/defaults.ts",
+        "src/app/shared/models/status.enum.ts"
+      ]
+    },
+    "deferred": {
+      "kind": "deferred-cycle",
+      "severity": "low",
+      "files": [
+        "src/app/features/orders/orders-sync.service.ts",
+        "src/app/features/orders/orders-cache.service.ts"
+      ]
+    },
+    "type-only": {
+      "kind": "type-only-cycle",
+      "severity": "info",
+      "files": [
+        "src/app/shared/models/invoice.model.ts",
+        "src/app/shared/models/customer.model.ts"
+      ]
+    },
+    "barrel-group": {
+      "kind": "deferred-cycle",
+      "severity": "low",
+      "minNodes": 10,
+      "members": [
+        "src/app/shared/index.ts",
+        "src/app/shared/utils/index.ts",
+        "src/app/shared/utils/registry.util.ts",
+        "src/app/features/widgets/index.ts",
+        "src/app/features/widgets/widgets-list.component.ts",
+        "src/app/features/widgets/widgets-detail.component.ts",
+        "src/app/features/widgets/widgets-card.component.ts",
+        "src/app/features/widgets/widgets-form.component.ts",
+        "src/app/features/widgets/widgets-table.component.ts",
+        "src/app/features/widgets/widgets-header.component.ts",
+        "src/app/features/widgets/widgets-footer.component.ts",
+        "src/app/features/widgets/widgets-sidebar.component.ts",
+        "src/app/features/widgets/widgets-toolbar.component.ts",
+        "src/app/features/widgets/widgets-filter.component.ts",
+        "src/app/features/widgets/widgets-summary.component.ts",
+        "src/app/features/widgets/widgets-chart.component.ts",
+        "src/app/features/widgets/widgets-badge.component.ts",
+        "src/app/features/widgets/widgets-panel.component.ts",
+        "src/app/features/widgets/widgets-dialog.component.ts"
+      ]
+    }
+  }
+}
