@@ -158,7 +158,8 @@ export const runCli = async (argv: string[]): Promise<number> => {
     const p = path.join(outDir, 'circular-deps.txt');
     const prev = process.stdout.isTTY;
     setColor(false);
-    fs.writeFileSync(p, renderTextReport(result, { ...textOpts, verbose: true }), 'utf8');
+    // The file version is always complete, regardless of --quiet/--verbose.
+    fs.writeFileSync(p, renderTextReport(result, { ...textOpts, verbose: true, quiet: false }), 'utf8');
     setColor(Boolean(prev) && !values['no-color'] && !values.json);
     written.push(p);
   }

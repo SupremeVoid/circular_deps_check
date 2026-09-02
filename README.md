@@ -104,6 +104,9 @@ bun run gen:fixtures  # regenerate fixtures/05-large-generated
 
 Fixtures under `fixtures/` document every supported pattern: barrels, path aliases, mutual standalone
 components, lazy routes, DI cycles, enum/const pairs, hoisted functions, `emitDecoratorMetadata`.
+`fixtures/05-large-generated` is a deterministic 3,000-file Angular-style project (seeded generator,
+`planted.json` lists the seven planted cycle groups); the perf test analyses it, including 557 spec
+entries and 10 lazy chunks, in about one second on a laptop.
 
 ## Known limitations
 
