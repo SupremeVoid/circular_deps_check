@@ -39,6 +39,8 @@ export interface JsonFinding {
     binding: string;
     /** Load-time call chain from `symbol()` to the read of `binding`. */
     via?: { fn: string; path: string; line: number }[];
+    /** Reason when the crash is possible but not certain. */
+    uncertain?: string;
     line: number;
     column: number;
     snippet: string;
@@ -111,6 +113,7 @@ export const toJsonReport = (result: AnalysisResult, version: string): JsonRepor
       to: rel(fp.to),
       symbol: fp.symbol,
       binding: fp.binding,
+      uncertain: fp.uncertain,
       via: fp.via?.map((v) => ({ fn: v.fn, path: rel(v.path), line: v.line })),
       line: fp.usage.line,
       column: fp.usage.column,

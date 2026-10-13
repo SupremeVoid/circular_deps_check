@@ -172,12 +172,15 @@ export const buildDiGraph = (graph: ModuleGraph): DiGraph => {
     if (info.decorator === 'none') continue;
     buildClass(id, ROOT);
   }
-  // Root-level providers (app.config.ts, bootstrapApplication, routes).
+  // Root-level providers (app.config.ts, bootstrapApplication, routes) and NgModule providers
+  // (a module's providers live in its module/environment injector, shared with root services).
   for (const mod of graph.modules.values()) {
-    for (const p of mod.rootProviders) {
+    const moduleProviders = mod.angular.filter((a) => a.decorator === 'NgModule').flatMap((a) => a.providers);
+    for (const p of [...mod.rootProviders, ...moduleProviders]) {
       const r = resolveToken(graph, mod, p.provide, cache);
       const providedId = addNode(r.node, ROOT);
-      buildProvider(p, mod, providedId, ROOT);
+      if (!p.useClass && !p.useExisting && !p.deps && classes.has(r.id)) buildClass(r.id, ROOT);
+      else buildProvider(p, mod, providedId, ROOT);
     }
   }
   // Component/directive scopes: the class itself resolves its deps in its own injector first.

@@ -21,6 +21,7 @@ import type {
   EntryKind,
   ExportKind,
   FailingUsage,
+  FootprintRef,
   ImportRecord,
   ImportSpecifierInfo,
   ModuleGraph,
@@ -29,6 +30,13 @@ import type {
 import { resolveExport, type ResolvedExport } from './graph.js';
 
 type EvalState = 0 | 1 | 2; // unvisited | in progress | done
+
+/** Readable name for a file outside the analysed set (package name for node_modules). */
+const shortPath = (p: string): string => {
+  const i = p.lastIndexOf('/node_modules/');
+  if (i >= 0) return p.slice(i + '/node_modules/'.length).replace(/(\/index)?\.d\.ts$/, '');
+  return p.split('/').slice(-3).join('/');
+};
 
 const MAX_CALL_DEPTH = 8;
 
@@ -64,7 +72,13 @@ export class Evaluator {
       const sorted = [...mod.imports].sort((a, b) => a.line - b.line || a.column - b.column);
       for (const record of sorted) {
         const to = record.resolvedPath;
-        if (!to || record.external || !graph.modules.has(to) || to === mod.path) continue;
+        if (!to || to === mod.path) continue;
+        if (record.external || !graph.modules.has(to)) {
+          // Files outside the analysed set (packages, excluded or generated files) are opaque leaf
+          // modules: their content is unknown, but *when* they load is part of the order.
+          if (record.kind !== 'dynamic' && !record.erased && !list.includes(to)) list.push(to);
+          continue;
+        }
         if (record.kind === 'dynamic') {
           dyn.push(to);
           continue;
@@ -120,7 +134,7 @@ export class Evaluator {
         stack.pop();
         path.pop();
         state.set(frame.node, 2);
-        evaluated++;
+        if (this.graph.modules.has(frame.node)) evaluated++;
       }
       results.push({ entry: root, kind: rootKind, breakages: [...byEdge.values()], evaluatedCount: evaluated });
     };
@@ -165,10 +179,19 @@ export class Evaluator {
           const names = member === '*' ? this.allExportNames(to) : [member];
           for (const name of names) {
             const resolved = resolveExport(this.graph, to, name, this.exportCache);
-            // Unresolvable (external re-export, parser gap): never guess – no finding.
-            if (!resolved || isTypeKind(resolved.record.kind) || isNamespaceReexport(resolved)) continue;
-            const { originPath, record: exp } = resolved;
             const failing: FailingUsage[] = [];
+            if (!resolved) {
+              // Re-exported from a file outside the analysed set: its content is unknown, but if it
+              // has not even loaded yet the read cannot succeed (reported as uncertain).
+              const opaque = usage.timing === 'eager' ? this.opaqueOrigin(to, name, ctx) : null;
+              if (opaque) {
+                failing.push({ specifier: spec, usage, binding: name, originPath: opaque.path, originKind: 'unknown', state: 'tdz', originState: 'not-started', uncertain: opaque.reason });
+                this.edge(byEdge, ctx, record).failing.push(...failing);
+              }
+              continue;
+            }
+            if (isTypeKind(resolved.record.kind) || isNamespaceReexport(resolved)) continue;
+            const { originPath, record: exp } = resolved;
             if (!this.initialised(originPath, exp.line, exp.kind, exp.hoisted, usage.line, ctx)) {
               if (usage.timing === 'eager') {
                 failing.push({
@@ -179,6 +202,7 @@ export class Evaluator {
                   originKind: exp.kind,
                   state: bindingStateFor(exp.kind, exp.hoisted),
                   originState: this.originState(originPath, ctx),
+                  uncertain: usage.assumed,
                 });
               } else {
                 this.edge(byEdge, ctx, record).deferredCount++;
@@ -188,7 +212,7 @@ export class Evaluator {
               // `Imported.staticMethod()` follows the static method.
               const local = exp.localName ?? name;
               const fn = spec.imported !== '*' && usage.access && usage.access !== '*' ? `${local}.${usage.access}` : local;
-              this.followCall(originPath, fn, usage, spec, ctx, [], new Set(), failing);
+              this.followCall(originPath, fn, usage, spec, ctx, [], new Set(), failing, usage.assumed, usage.decoratorFactory === true);
             }
             if (failing.length > 0) {
               this.edge(byEdge, ctx, record).failing.push(...failing);
@@ -223,6 +247,8 @@ export class Evaluator {
     steps: CallStep[],
     visited: Set<string>,
     out: FailingUsage[],
+    uncertain?: string,
+    includeReturned = false,
   ): void {
     if (steps.length >= MAX_CALL_DEPTH) return;
     const key = `${origin}#${fn}`;
@@ -232,30 +258,36 @@ export class Evaluator {
     const fp = omod?.footprints[fn];
     if (!omod || !fp) return;
 
-    const fail = (binding: string, bindingOrigin: string, kind: ExportKind, hoisted: boolean, line: number): void => {
+    const why = (ref: FootprintRef): string | undefined =>
+      uncertain ?? (ref.conditional ? `the read sits in a branch of \`${fn}()\` that may not run on this call` : ref.assumed);
+    const fail = (binding: string, bindingOrigin: string, kind: ExportKind, hoisted: boolean, ref: FootprintRef): void => {
       out.push({
         specifier: spec,
         usage,
         binding,
-        via: [...steps, { fn, path: origin, line }],
+        via: [...steps, { fn, path: origin, line: ref.line }],
         originPath: bindingOrigin,
         originKind: kind,
         state: bindingStateFor(kind, hoisted),
         originState: this.originState(bindingOrigin, ctx),
+        uncertain: why(ref),
       });
     };
+    // A decorator factory's returned function is applied immediately at class definition.
+    const locals = includeReturned ? [...fp.locals, ...fp.returned.locals] : fp.locals;
+    const imports = includeReturned ? [...fp.imports, ...fp.returned.imports] : fp.imports;
 
-    for (const loc of fp.locals) {
+    for (const loc of locals) {
       const decl = omod.topLevel[loc.name];
       if (!decl || isTypeKind(decl.kind)) continue;
       if (!this.initialised(origin, decl.line, decl.kind, false, usage.line, ctx)) {
-        fail(loc.name, origin, decl.kind, false, loc.line);
+        fail(loc.name, origin, decl.kind, false, loc);
       } else if (loc.call) {
-        this.followCall(origin, loc.member ? `${loc.name}.${loc.member}` : loc.name, usage, spec, ctx, [...steps, { fn, path: origin, line: loc.line }], visited, out);
+        this.followCall(origin, loc.member ? `${loc.name}.${loc.member}` : loc.name, usage, spec, ctx, [...steps, { fn, path: origin, line: loc.line }], visited, out, why(loc));
       }
     }
 
-    for (const imp of fp.imports) {
+    for (const imp of imports) {
       const found = this.findBinding(omod.imports, imp.local);
       if (!found) continue;
       const { record, spec: ospec } = found;
@@ -267,13 +299,40 @@ export class Evaluator {
       if (!resolved || isTypeKind(resolved.record.kind) || isNamespaceReexport(resolved)) continue;
       const exp = resolved.record;
       if (!this.initialised(resolved.originPath, exp.line, exp.kind, exp.hoisted, usage.line, ctx)) {
-        fail(name, resolved.originPath, exp.kind, exp.hoisted, imp.line);
+        fail(name, resolved.originPath, exp.kind, exp.hoisted, imp);
       } else if (imp.call) {
         const local = exp.localName ?? name;
         const next = ospec.imported !== '*' && imp.member ? `${local}.${imp.member}` : local;
-        this.followCall(resolved.originPath, next, usage, spec, ctx, [...steps, { fn, path: origin, line: imp.line }], visited, out);
+        this.followCall(resolved.originPath, next, usage, spec, ctx, [...steps, { fn, path: origin, line: imp.line }], visited, out, why(imp));
       }
     }
+  }
+
+  /**
+   * `name` is not declared inside the analysed set. If `path` (or a barrel it re-exports through)
+   * names a file outside the set as its source and that file has not loaded yet, the read fails.
+   */
+  private opaqueOrigin(path: string, name: string, ctx: BodyCheck, seen = new Set<string>()): { path: string; reason: string } | null {
+    if (seen.has(path)) return null;
+    seen.add(path);
+    const mod = this.graph.modules.get(path);
+    if (!mod) return null;
+    const re = mod.exports.find((e) => e.name === name && e.kind === 'reexport' && e.from && !this.graph.modules.has(e.from));
+    if (re?.from) {
+      return (ctx.state.get(re.from) ?? 0) === 2
+        ? null
+        : { path: re.from, reason: `\`${name}\` is re-exported from \`${shortPath(re.from)}\` (outside the analysed files), which has not loaded yet at this point` };
+    }
+    for (const star of mod.exportStar) {
+      if (!star) continue;
+      if (this.graph.modules.has(star)) {
+        const inner = this.opaqueOrigin(star, name, ctx, seen);
+        if (inner) return inner;
+      } else if ((ctx.state.get(star) ?? 0) !== 2) {
+        return { path: star, reason: `\`${name}\` probably comes from \`export * from '${shortPath(star)}'\` (outside the analysed files), which has not loaded yet at this point` };
+      }
+    }
+    return null;
   }
 
   /** Every name exported by `path`, including names reached through `export *` (inside the analysed set). */

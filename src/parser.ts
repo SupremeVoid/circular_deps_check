@@ -41,6 +41,12 @@ interface WalkCtx {
   declName?: string;
   /** Footprint collection mode: record references into this footprint instead of usages. */
   footprint?: Footprint;
+  /** Footprint mode: inside a branch that may not run. */
+  conditional?: boolean;
+  /** Footprint mode: inside a function returned by the walked function. */
+  fpReturned?: boolean;
+  /** The code only runs now under an assumption (reason shown to the user). */
+  assumed?: string;
 }
 
 const ANGULAR_ALL_DECORATORS: ReadonlySet<string> = new Set([
@@ -516,6 +522,7 @@ class FileParser {
   }
 
   private walk(node: ts.Node, ctx: WalkCtx): void {
+    if (ctx.footprint && this.walkFootprintControlFlow(node, ctx)) return;
     // Instantiation expression `Foo<string>` (TS 4.7+) is a value reference despite being a TypeNode.
     if (!ctx.typePos && ts.isExpressionWithTypeArguments(node) && !ts.isHeritageClause(node.parent)) {
       this.walk(node.expression, ctx);
@@ -628,7 +635,12 @@ class FileParser {
           if (ctx.timing === 'eager' && !ctx.typePos && this.localCallables.has(call.expression.text)) {
             this.eagerInvoked.add(call.expression.text);
           }
-        } else if (ts.isPropertyAccessExpression(call.expression) && ts.isIdentifier(call.expression.expression) && ctx.timing === 'eager' && !ctx.typePos) {
+        }
+        // `[1, 2].forEach(localFn)` – a local function passed by reference to a synchronous array method runs now
+        if (ctx.timing === 'eager' && !ctx.typePos && ts.isPropertyAccessExpression(call.expression) && SYNC_CALLBACK_METHODS.has(call.expression.name.text)) {
+          for (const arg of call.arguments) if (ts.isIdentifier(arg) && this.localCallables.has(arg.text) && !this.isShadowed(arg.text)) this.eagerInvoked.add(arg.text);
+        }
+        if (ts.isPropertyAccessExpression(call.expression) && ts.isIdentifier(call.expression.expression) && ctx.timing === 'eager' && !ctx.typePos) {
           // `LocalClass.staticMethod()` at load time
           const key = `${call.expression.expression.text}.${call.expression.name.text}`;
           if (this.localCallables.has(key) && !this.isShadowed(call.expression.expression.text)) this.eagerInvoked.add(key);
@@ -724,6 +736,46 @@ class FileParser {
     return true;
   }
 
+  /**
+   * Footprint mode: code in branches may not run on a given call (`if (lazy) return A;`), and a
+   * returned function only runs if the caller invokes the result (decorator factories do).
+   */
+  private walkFootprintControlFlow(node: ts.Node, ctx: WalkCtx): boolean {
+    const cond: WalkCtx = { ...ctx, conditional: true };
+    if (ts.isIfStatement(node)) {
+      this.walk(node.expression, ctx);
+      this.walk(node.thenStatement, cond);
+      if (node.elseStatement) this.walk(node.elseStatement, cond);
+      return true;
+    }
+    if (ts.isConditionalExpression(node)) {
+      this.walk(node.condition, ctx);
+      this.walk(node.whenTrue, cond);
+      this.walk(node.whenFalse, cond);
+      return true;
+    }
+    if (ts.isBinaryExpression(node)) {
+      const k = node.operatorToken.kind;
+      const logical = [ts.SyntaxKind.AmpersandAmpersandToken, ts.SyntaxKind.BarBarToken, ts.SyntaxKind.QuestionQuestionToken,
+        ts.SyntaxKind.AmpersandAmpersandEqualsToken, ts.SyntaxKind.BarBarEqualsToken, ts.SyntaxKind.QuestionQuestionEqualsToken];
+      if (logical.includes(k)) {
+        this.walk(node.left, ctx);
+        this.walk(node.right, cond);
+        return true;
+      }
+      return false;
+    }
+    if (ts.isCaseClause(node) || ts.isDefaultClause(node) || ts.isCatchClause(node)) {
+      ts.forEachChild(node, (child) => this.walk(child, cond));
+      return true;
+    }
+    if (ts.isReturnStatement(node) && node.expression && (ts.isArrowFunction(node.expression) || ts.isFunctionExpression(node.expression)) && !ctx.fpReturned) {
+      this.walkFunctionLike(node.expression, { ...ctx, fpReturned: true }, true);
+      return true;
+    }
+    return false;
+  }
+
   private walkBindingName(name: ts.BindingName, ctx: WalkCtx): void {
     if (ts.isIdentifier(name)) return;
     for (const el of name.elements) {
@@ -734,6 +786,12 @@ class FileParser {
   private walkFunctionLike(fn: ts.SignatureDeclaration | ts.FunctionLikeDeclaration, ctx: WalkCtx, iife: boolean): void {
     // Footprints only cover code that runs when the function itself runs: skip nested callbacks.
     if (ctx.footprint && !iife) return;
+    const fnBody = (fn as ts.FunctionLikeDeclaration).body;
+    if (ctx.footprint && !ctx.fpReturned && fnBody && (ts.isArrowFunction(fnBody) || ts.isFunctionExpression(fnBody))) {
+      // `(name) => (cls) => …` – the returned function is what a decorator factory applies.
+      this.walkFunctionLike(fnBody, { ...ctx, fpReturned: true }, true);
+      return;
+    }
     const decorators = ts.canHaveDecorators(fn) ? ts.getDecorators(fn) : undefined;
     for (const d of decorators ?? []) this.walk(d, ctx);
 
@@ -746,7 +804,12 @@ class FileParser {
     let inner: WalkCtx;
     if (iife) {
       const cb = syncCallbackOf(fn);
-      inner = { ...ctx, desc: cb && !ctx.footprint ? `${ctx.desc} (callback passed to \`${cb}\` runs immediately)` : ctx.footprint ? ctx.desc : `${ctx.desc} (immediately-invoked function)` };
+      const assumed = cb && !cb.certain ? `callback passed to \`${cb.name}\`, assumed to run immediately (the receiver may not be an array)` : undefined;
+      inner = {
+        ...ctx,
+        desc: cb && !ctx.footprint ? `${ctx.desc} (callback passed to \`${cb.name}\` runs immediately)` : ctx.footprint ? ctx.desc : `${ctx.desc} (immediately-invoked function)`,
+        assumed: ctx.assumed ?? assumed,
+      };
     } else if (ctx.timing === 'deferred' || ctx.timing === 'type') {
       inner = ctx;
     } else {
@@ -914,10 +977,10 @@ class FileParser {
     }
     if (ctx.footprint) {
       if (ctx.typePos || this.isShadowed(id.text)) return;
-      const line = this.pos(id).line;
-      const call = isInvoked(id, member !== undefined);
-      if (this.bindings.has(id.text)) ctx.footprint.imports.push({ local: id.text, member, line, call });
-      else if (this.topLevel[id.text]) ctx.footprint.locals.push({ name: id.text, member, line, call });
+      const ref = { line: this.pos(id).line, call: isInvoked(id, member !== undefined), conditional: ctx.conditional || undefined, assumed: ctx.assumed };
+      const target = ctx.fpReturned ? ctx.footprint.returned : ctx.footprint;
+      if (this.bindings.has(id.text)) target.imports.push({ local: id.text, member, ...ref });
+      else if (this.topLevel[id.text]) target.locals.push({ name: id.text, member, ...ref });
       return;
     }
     const binding = this.bindings.get(id.text);
@@ -944,6 +1007,8 @@ class FileParser {
     if (ctx.decorator && !ctx.typePos) usage.decorator = ctx.decorator;
     if (ctx.property && !ctx.typePos) usage.property = ctx.property;
     if (!ctx.typePos && isInvoked(id, member !== undefined)) usage.call = true;
+    if (!ctx.typePos && isDecoratorFactoryCallee(id, member !== undefined)) usage.decoratorFactory = true;
+    if (ctx.assumed && !ctx.typePos && timing === 'eager') usage.assumed = ctx.assumed;
     this.recordUsage(spec, usage);
 
     if (timing !== 'type' && ctx.declName) {
@@ -1032,7 +1097,7 @@ class FileParser {
    */
   private computeFootprints(): void {
     for (const [name, node] of this.localCallables) {
-      const fp: Footprint = { line: this.pos(node).line, imports: [], locals: [] };
+      const fp: Footprint = { line: this.pos(node).line, imports: [], locals: [], returned: { imports: [], locals: [] } };
       const ctx: WalkCtx = { timing: 'eager', kind: 'top-level-call', desc: '', typePos: false, footprint: fp };
       if (ts.isClassDeclaration(node)) {
         this.scopes.push(new Set());
@@ -1342,15 +1407,44 @@ const SYNC_CALLBACK_METHODS: ReadonlySet<string> = new Set([
  * Callbacks that run synchronously while their caller runs: array iteration methods
  * (`items.map(cb)`), `Array.from(x, cb)` and `new Promise(executor)`. Returns a display name.
  */
-const syncCallbackOf = (fn: ts.Node): string | null => {
+const syncCallbackOf = (fn: ts.Node): { name: string; certain: boolean } | null => {
   const p = fn.parent;
   if (!p) return null;
   if (ts.isCallExpression(p) && p.arguments.includes(fn as ts.Expression) && ts.isPropertyAccessExpression(p.expression)) {
     const name = p.expression.name.text;
-    if (SYNC_CALLBACK_METHODS.has(name)) return `.${name}()`;
+    if (SYNC_CALLBACK_METHODS.has(name)) {
+      if (name === 'from') {
+        const recv = p.expression.expression;
+        return ts.isIdentifier(recv) && recv.text === 'Array' ? { name: 'Array.from()', certain: true } : null;
+      }
+      return { name: `.${name}()`, certain: isArrayExpression(p.expression.expression) };
+    }
   }
-  if (ts.isNewExpression(p) && ts.isIdentifier(p.expression) && p.expression.text === 'Promise' && p.arguments?.[0] === fn) return 'new Promise()';
+  if (ts.isNewExpression(p) && ts.isIdentifier(p.expression) && p.expression.text === 'Promise' && p.arguments?.[0] === fn) return { name: 'new Promise()', certain: true };
   return null;
+};
+
+/** Syntactically certain arrays: literals, Object.keys/values/entries, Array.from/of, and array-method chains on them. */
+const isArrayExpression = (e: ts.Expression): boolean => {
+  let cur = e;
+  while (ts.isParenthesizedExpression(cur) || ts.isAsExpression(cur) || ts.isSatisfiesExpression(cur) || ts.isNonNullExpression(cur)) cur = cur.expression;
+  if (ts.isArrayLiteralExpression(cur)) return true;
+  if (ts.isCallExpression(cur) && ts.isPropertyAccessExpression(cur.expression)) {
+    const recv = cur.expression.expression;
+    const name = cur.expression.name.text;
+    if (ts.isIdentifier(recv) && recv.text === 'Object' && ['keys', 'values', 'entries', 'getOwnPropertyNames'].includes(name)) return true;
+    if (ts.isIdentifier(recv) && recv.text === 'Array' && (name === 'from' || name === 'of')) return true;
+    if (['map', 'filter', 'flatMap', 'slice', 'concat', 'toSorted', 'sort', 'reverse', 'flat'].includes(name)) return isArrayExpression(recv);
+  }
+  return false;
+};
+
+/** `@Register('x')`: the identifier is the callee of a call that is itself the decorator expression. */
+const isDecoratorFactoryCallee = (id: ts.Identifier, viaMember: boolean): boolean => {
+  let node: ts.Node = id;
+  if (viaMember && id.parent && ts.isPropertyAccessExpression(id.parent)) node = id.parent;
+  const p = node.parent;
+  return Boolean(p && ts.isCallExpression(p) && p.expression === node && p.parent && ts.isDecorator(p.parent));
 };
 
 /** `Object.keys(ns)`, `Object.values(ns)`, `{ ...ns }`, `[...Object.entries(ns)]`, `for (k in ns)` read every binding. */
@@ -1384,6 +1478,8 @@ const isInvoked = (id: ts.Identifier, viaMember: boolean): boolean => {
   const p = node.parent;
   if (!p) return false;
   if ((ts.isCallExpression(p) || ts.isNewExpression(p)) && p.expression === node) return true;
+  // passed by reference to a synchronous array method: `[...].forEach(fn)`
+  if (ts.isCallExpression(p) && p.arguments.includes(node as ts.Expression) && ts.isPropertyAccessExpression(p.expression) && SYNC_CALLBACK_METHODS.has(p.expression.name.text)) return true;
   if (ts.isTaggedTemplateExpression(p) && p.tag === node) return true;
   if (ts.isDecorator(p)) return true;
   return false;

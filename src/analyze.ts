@@ -261,7 +261,7 @@ const composeFindings = (
         }
         let fp = perEdge.get(key);
         if (!fp) {
-          fp = { from: b.from, to: b.to, usage: f.usage, symbol, binding: f.binding, via: f.via, originPath: f.originPath, originKind: f.originKind, state: f.state, entries: [] };
+          fp = { from: b.from, to: b.to, usage: f.usage, symbol, binding: f.binding, via: f.via, uncertain: f.uncertain, originPath: f.originPath, originKind: f.originKind, state: f.state, entries: [] };
           perEdge.set(key, fp);
         }
         if (f.originState === 'in-progress') inProgress.set(fp, true);
@@ -270,13 +270,8 @@ const composeFindings = (
     }
   }
 
-  for (const perEdge of failuresByEdge.values()) {
-    const failures = [...perEdge.values()].sort((a, b) => a.usage.line - b.usage.line || a.usage.column - b.usage.column);
-    for (const fp of failures) fp.entries.sort((a, b) => ENTRY_RANK[a.kind] - ENTRY_RANK[b.kind] || a.entry.localeCompare(b.entry));
-    const kinds = new Set(failures.flatMap((f) => f.entries.map((e) => e.kind)));
-    const kind: FindingKind = kinds.has('main') || kinds.has('lazy') ? 'runtime-break' : kinds.has('test') ? 'test-break' : 'latent-cycle';
-    // Hypothetical orders only matter when no real entry triggers the failure.
-    if (kind !== 'latent-cycle') for (const fp of failures) fp.entries = fp.entries.filter((e) => e.kind !== 'hypothetical');
+  const isReal = (fp: FailurePoint): boolean => fp.entries.some((e) => e.kind !== 'hypothetical');
+  const pushFailures = (failures: FailurePoint[], kind: FindingKind): void => {
     const first = failures[0]!;
     const from = first.from;
     const scc = sccByNode.get(from);
@@ -284,39 +279,69 @@ const composeFindings = (
     const symbols = [...new Set(failures.map((f) => (f.via ? `${f.symbol}()` : f.symbol)))];
     // `var`/`enum`/`namespace` bindings are `undefined` before their module runs: reading a member
     // or calling throws, merely capturing the value (`[MyEnum]`) silently stores `undefined`.
-    const throws = first.state === 'tdz' || first.via !== undefined || first.usage.call === true || first.usage.access !== undefined;
+    const throwsAt = (f: FailurePoint): boolean => f.state === 'tdz' || f.via !== undefined || f.usage.call === true || f.usage.access !== undefined;
+    const silent = failures.every((f) => !throwsAt(f));
     const errorText =
       first.state === 'tdz'
         ? `ReferenceError: Cannot access '${first.binding}' before initialization`
-        : throws
+        : throwsAt(first)
           ? `TypeError: '${first.binding}' is undefined at this point`
           : `'${first.binding}' is still undefined here – no error at load time, but the captured value is silently missing`;
     const origin = rel(first.originPath ?? first.to);
     const what = first.via
       ? `calls \`${first.symbol}()\` at load time, which reads \`${first.binding}\` (${first.originKind} in \`${origin}\`)`
-      : `reads \`${first.symbol}\` (${first.originKind} declared in \`${origin}\`)`;
+      : `reads \`${first.symbol}\` (${first.originKind === 'unknown' ? 'binding' : first.originKind} from \`${origin}\`)`;
+    const realEntry = first.entries.find((e) => e.kind !== 'hypothetical');
     const when =
-      kind === 'latent-cycle'
-        ? ` if \`${rel(first.entries[0]!.entry)}\` is the first file of this cycle to be imported`
+      kind !== 'latent-cycle'
+        ? ''
+        : realEntry
+          ? ` when loaded from \`${rel(realEntry.entry)}\``
+          : ` if \`${rel(first.entries[0]!.entry)}\` is the first file of this cycle to be imported`;
+    const caveat = first.uncertain
+      ? ` Not certain: ${first.uncertain}.`
+      : kind === 'latent-cycle'
+        ? ' The current entry points happen to load this cycle in a safe order.'
         : '';
     const titleWhat = first.via ? `\`${first.symbol}()\` reads \`${first.binding}\` before initialisation` : `\`${symbols.join('`, `')}\` read before initialisation`;
+    const base: Severity = kind === 'runtime-break' ? 'critical' : kind === 'test-break' ? 'high' : 'medium';
+    const severity: Severity = silent ? (base === 'critical' ? 'high' : base === 'high' ? 'medium' : 'low') : base;
+    const prefix = silent
+      ? 'Silently undefined'
+      : kind === 'runtime-break'
+        ? 'Load-time crash'
+        : kind === 'test-break'
+          ? 'Crashes when loaded from tests'
+          : first.uncertain
+            ? 'Possible crash'
+            : 'Order-dependent crash';
     findings.push({
       id: '',
-      severity: kind === 'runtime-break' ? 'critical' : kind === 'test-break' ? 'high' : 'medium',
+      severity,
       kind,
-      title:
-        kind === 'runtime-break'
-          ? `Load-time crash: ${titleWhat} in \`${rel(from)}\``
-          : kind === 'test-break'
-            ? `Crashes when loaded from tests: ${titleWhat} in \`${rel(from)}\``
-            : `Order-dependent crash: ${titleWhat} in \`${rel(from)}\``,
-      summary: `\`${rel(from)}:${first.usage.line}\` ${what} before that module has finished loading${when} → ${errorText}.${kind === 'latent-cycle' ? ' The current entry points happen to load this cycle in a safe order.' : ''}`,
+      title: `${prefix}: ${titleWhat} in \`${rel(from)}\``,
+      summary: `\`${rel(from)}:${first.usage.line}\` ${what} before that module has finished loading${when} → ${errorText}.${caveat}`,
       sccId: scc?.id ?? 0,
       cycle,
       failures,
       suggestions: suggestForCycle(sctx, cycle, failures),
       edgeNotes: cycle.edges.map(edgeNoteFor),
     });
+  };
+
+  for (const perEdge of failuresByEdge.values()) {
+    const all = [...perEdge.values()].sort((a, b) => a.usage.line - b.usage.line || a.usage.column - b.usage.column);
+    for (const fp of all) fp.entries.sort((a, b) => ENTRY_RANK[a.kind] - ENTRY_RANK[b.kind] || a.entry.localeCompare(b.entry));
+    // Certain failures under a real entry are crashes; failures that only happen under another
+    // import order, or that depend on an assumption, are reported separately as "medium".
+    const certain = all.filter((fp) => !fp.uncertain && isReal(fp));
+    const rest = all.filter((fp) => !certain.includes(fp));
+    if (certain.length > 0) {
+      for (const fp of certain) fp.entries = fp.entries.filter((e) => e.kind !== 'hypothetical');
+      const kinds = new Set(certain.flatMap((f) => f.entries.map((e) => e.kind)));
+      pushFailures(certain, kinds.has('main') || kinds.has('lazy') ? 'runtime-break' : 'test-break');
+    }
+    if (rest.length > 0) pushFailures(rest, 'latent-cycle');
   }
 
   // 2. DI cycles ---------------------------------------------------------------------------------

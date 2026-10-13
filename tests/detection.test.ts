@@ -402,3 +402,121 @@ describe('suggestions stay honest', () => {
     expect(move.details!.join(' ')).toContain('src/a.ts');
   });
 });
+
+describe('certainty: what is proven vs. possible', () => {
+  it('reports a read inside a branch of a called helper as a possible crash, not a certain one', async () => {
+    const r = await analyzeProject({
+      'src/main.ts': `import './b';\n`,
+      'src/a.ts': `import { get } from './b';\nexport const V = get(false);\n`,
+      'src/b.ts': `import { V } from './a';\nconst A = 1;\nexport function get(useA: boolean) { if (useA) return A; return 0; }\nexport const later = () => V;\n`,
+    });
+    expect(r.findings.filter((f) => f.severity === 'critical')).toHaveLength(0);
+    const m = r.findings.find((f) => f.kind === 'latent-cycle')!;
+    expect(m.severity).toBe('medium');
+    expect(m.title).toStartWith('Possible crash');
+    expect(m.failures[0]!.uncertain).toContain('branch of `get()`');
+  });
+
+  it('treats .map() on something that may not be an array as an assumption', async () => {
+    const r = await analyzeProject({
+      'src/main.ts': `import './b';\n`,
+      'src/a.ts': `import { B } from './b';\nconst obs = { map(fn: () => number) { return obs; } };\nexport const o = obs.map(() => B.n);\n`,
+      'src/b.ts': `import { o } from './a';\nexport class B { static n = 1; }\nexport const later = () => o;\n`,
+    });
+    expect(r.findings.filter((f) => f.severity === 'critical')).toHaveLength(0);
+    const m = r.findings.find((f) => f.kind === 'latent-cycle')!;
+    expect(m.failures[0]!.uncertain).toContain('assumed to run immediately');
+  });
+
+  it('keeps hypothetical-only failures out of a critical finding on the same import', async () => {
+    // a <-> b: from main only a's static read crashes; with b imported first, b's read crashes too.
+    const r = await analyzeProject({
+      'src/main.ts': `import './b';\n`,
+      'src/a.ts': `import { B, B2 } from './b';\nexport const A = 1;\nexport const fromB = B;\nexport function later() { return B2; }\n`,
+      'src/b.ts': `import { A, fromB } from './a';\nexport const B = 2;\nexport const B2 = 3;\nexport const useA = () => [A, fromB];\n`,
+    });
+    for (const f of r.findings) for (const fp of f.failures) expect(fp.entries.length).toBeGreaterThan(0);
+    const crit = r.findings.filter((f) => f.severity === 'critical');
+    expect(crit.every((f) => f.failures.every((fp) => fp.entries.every((e) => e.kind !== 'hypothetical')))).toBe(true);
+  });
+
+  it('calls a captured undefined value "silently undefined", one level below a crash', async () => {
+    const r = await analyzeProject({
+      'src/main.ts': `import './b';\n`,
+      'src/a.ts': `import { Color } from './b';\nexport const ALL = [Color];\n`,
+      'src/b.ts': `import { ALL } from './a';\nexport enum Color { Red }\nexport const later = () => ALL;\n`,
+    });
+    const f = r.findings.find((x) => x.kind === 'runtime-break')!;
+    expect(f.severity).toBe('high');
+    expect(f.title).toStartWith('Silently undefined');
+    expect(f.summary).toContain('no error at load time');
+  });
+});
+
+describe('more load-time reads', () => {
+  it('follows the closure a decorator factory returns (applied at class definition)', async () => {
+    const r = await analyzeProject({
+      'src/main.ts': `import './registry';\n`,
+      'src/registry.ts': `import { B } from './b';\nexport const REGISTRY = new Map<string, unknown>();\nexport function Register(name: string) { return (cls: unknown) => { REGISTRY.set(name, cls); }; }\nexport const all = () => B;\n`,
+      'src/b.ts': `import { Register } from './registry';\n@Register('b')\nexport class B {}\n`,
+    });
+    const f = r.findings.find((x) => x.kind === 'runtime-break')!;
+    expect(f).toBeDefined();
+    expect(f.failures[0]!.binding).toBe('REGISTRY');
+    expect(f.failures[0]!.via![0]!.fn).toBe('Register');
+  });
+
+  it('treats a local function passed by reference to forEach on an array as called now', async () => {
+    const r = await analyzeProject({
+      'src/main.ts': `import './b';\n`,
+      'src/a.ts': `import { B } from './b';\nfunction add(x: number) { return x + B.n; }\n[1, 2].forEach(add);\nexport const A = 1;\n`,
+      'src/b.ts': `import { A } from './a';\nexport class B { static n = 1; }\nexport const later = () => A;\n`,
+    });
+    expect(r.findings.find((x) => x.kind === 'runtime-break')!.failures[0]!.symbol).toBe('B');
+  });
+
+  it('flags reads of re-exports from files outside the analysed set that have not loaded yet (uncertain)', async () => {
+    const r = await analyzeProject(
+      {
+        'src/main.ts': `import './index';\n`,
+        'src/index.ts': `export * from './a';\nexport * from './gen/api';\n`,
+        'src/a.ts': `import { API } from './index';\nexport const client = API.create();\n`,
+        'src/gen/api.ts': `export const API = { create: () => 1 };\n`,
+      },
+      { include: ['src/main.ts', 'src/index.ts', 'src/a.ts'] },
+    );
+    const f = r.findings.find((x) => x.failures.some((fp) => fp.binding === 'API'))!;
+    expect(f).toBeDefined();
+    expect(f.severity).toBe('medium');
+    expect(f.failures[0]!.uncertain).toContain('outside the analysed files');
+  });
+
+  it('stays quiet when the file outside the analysed set has already loaded', async () => {
+    const r = await analyzeProject(
+      {
+        'src/main.ts': `import './gen/api';\nimport './index';\n`,
+        'src/index.ts': `export * from './a';\nexport * from './gen/api';\n`,
+        'src/a.ts': `import { API } from './index';\nexport const client = API.create();\n`,
+        'src/gen/api.ts': `export const API = { create: () => 1 };\n`,
+      },
+      { include: ['src/main.ts', 'src/index.ts', 'src/a.ts'] },
+    );
+    // nothing from the real entry (the file is loaded first) …
+    expect(r.findings.filter((f) => f.failures.some((fp) => fp.binding === 'API' && fp.entries.some((e) => e.kind === 'main')))).toHaveLength(0);
+    // … but a file of the cycle imported first (e.g. by a spec) still reads it too early
+    expect(r.findings.filter((f) => f.failures.some((fp) => fp.binding === 'API')).every((f) => f.severity === 'medium')).toBe(true);
+  });
+});
+
+describe('Angular DI (NgModule)', () => {
+  it('detects cycles between NgModule providers', async () => {
+    const r = await analyzeProject({
+      'src/main.ts': `import './app.module';\n`,
+      'src/tokens.ts': `import { InjectionToken } from '@angular/core';\nexport const TOK = new InjectionToken<unknown>('tok');\n`,
+      'src/x.service.ts': `import { Injectable, inject } from '@angular/core';\nimport { TOK } from './tokens';\n@Injectable()\nexport class XService { private readonly t = inject(TOK); }\n`,
+      'src/app.module.ts': `import { NgModule } from '@angular/core';\nimport { TOK } from './tokens';\nimport { XService } from './x.service';\n@NgModule({ providers: [XService, { provide: TOK, useExisting: XService }] })\nexport class AppModule {}\n`,
+    });
+    expect(r.diCycles).toHaveLength(1);
+    expect(r.diCycles[0]!.nodes.map((n) => n.name).sort()).toEqual(['TOK', 'XService']);
+  });
+});

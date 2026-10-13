@@ -51,6 +51,10 @@ export interface Usage {
    * records the individual members instead).
    */
   access?: string;
+  /** The read only happens under an assumption the analysis cannot prove (e.g. a `.forEach` receiver that may not be an array). */
+  assumed?: string;
+  /** Callee of a decorator factory call (`@Register('x')`): the returned decorator also runs at class definition. */
+  decoratorFactory?: boolean;
 }
 
 export interface ImportSpecifierInfo {
@@ -144,10 +148,21 @@ export interface TopLevelDecl {
  * bindings of its own file and imported bindings, referenced directly in its body (nested
  * callbacks that are not invoked immediately are excluded to avoid false positives).
  */
+export interface FootprintRef {
+  line: number;
+  call: boolean;
+  /** Inside a branch (if/else, ternary, &&, ||, ??, switch case, catch) – may not run on every call. */
+  conditional?: boolean;
+  /** Read inside a callback that is only assumed to run synchronously. */
+  assumed?: string;
+}
+
 export interface Footprint {
   line: number;
-  imports: { local: string; member?: string; line: number; call: boolean }[];
-  locals: { name: string; member?: string; line: number; call: boolean }[];
+  imports: (FootprintRef & { local: string; member?: string })[];
+  locals: (FootprintRef & { name: string; member?: string })[];
+  /** References inside a function the callee returns (followed for decorator factories: the result is applied at once). */
+  returned: { imports: (FootprintRef & { local: string; member?: string })[]; locals: (FootprintRef & { name: string; member?: string })[] };
 }
 
 export interface DiDependencyFlags {
@@ -287,6 +302,8 @@ export interface FailingUsage {
   binding: string;
   /** Call chain from the usage into the function(s) that read the uninitialised binding. */
   via?: CallStep[];
+  /** Set when the failure depends on something the analysis cannot prove (branch, assumed callback, opaque module). */
+  uncertain?: string;
   /** Module where the binding is declared (after following re-exports). */
   originPath: string | null;
   originKind: ExportKind;
@@ -380,6 +397,8 @@ export interface FailurePoint {
   /** The binding that is not initialised (equals `symbol` unless reached through a call chain). */
   binding: string;
   via?: CallStep[];
+  /** The crash is possible but not certain (reason). */
+  uncertain?: string;
   originPath: string | null;
   originKind: ExportKind;
   state: BindingState;
