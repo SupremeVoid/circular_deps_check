@@ -16,8 +16,11 @@ describe('text report', () => {
     expect(text).toContain('Evaluation order (from src/main.ts)');
     expect(text).toContain('src/main.ts → src/app/app.ts ⟳ → src/app/config.ts ✖');
     expect(text).toContain('Breaks in tests (1 spec): src/app/base.component.spec.ts');
-    expect(text).toContain('Fix plan per cyclic group');
-    expect(text).toContain('✔ plan verified acyclic');
+    // groups with their verified fix come first, before the per-finding details
+    expect(text).toContain('Problems – fix these first');
+    expect(text).toContain('✖ Group #1: 2 files – 1 critical (C1)');
+    expect(text).toContain('✔ fix (verified, 1 import):');
+    expect(text.indexOf('Problems – fix these first')).toBeLessThan(text.indexOf('[C1] CRITICAL'));
     expect(text).toContain('[C5] INFO');
     expect(text).not.toMatch(/\x1b\[/);
   });
@@ -82,7 +85,9 @@ describe('html report', () => {
     const embedded = JSON.parse(html.slice(dataStart, dataEnd)) as { findings: unknown[]; groups: unknown[] };
     expect(embedded.findings).toHaveLength(r.findings.length);
     expect(embedded.groups).toHaveLength(r.sccs.length);
-    expect(html).toContain('How to read this');
+    expect(html).toContain("'Guide'");
+    expect(html).toContain('Problems (');
+    expect(html).toContain('vscode://file/');
     expect(html).toContain('forwardRef');
   });
 

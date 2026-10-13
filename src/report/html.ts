@@ -164,6 +164,11 @@ details.more > summary { cursor: pointer; color: var(--accent); font-size: 12.5p
 .prose h3 { margin: 18px 0 6px; font-size: 15px; }
 .prose p, .prose li { max-width: 860px; }
 .edlink { font-size: 11.5px; white-space: nowrap; }
+.fc { display: flex; flex-direction: column; min-width: 0; }
+.fc .mono { white-space: nowrap; }
+.fc .dir { color: var(--faint); font-size: 11px; }
+td.syms .muted { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; overflow-wrap: normal; }
+.linkbtn { background: none; border: none; color: var(--accent); cursor: pointer; padding: 6px 0; font-size: 12.5px; }
 `;
 
 /* Client script: written without backticks / template placeholders so it can live in String.raw. */
@@ -195,6 +200,11 @@ const CLIENT_JS = String.raw`
   function editorUrl(rel, line, col) {
     var abs = /^([a-zA-Z]:)?\//.test(rel) ? rel : data.root.replace(/\/$/, '') + '/' + rel;
     return 'vscode://file/' + encodeURI(abs).replace(/#/g, '%23') + ':' + (line || 1) + ':' + (col || 1);
+  }
+  /** File name first (what people scan for), folder underneath in muted text. */
+  function fileCell(p) {
+    var parts = String(p).split('/'); var name = parts.pop(); var dir = parts.slice(-2).join('/');
+    return '<div class="fc" title="' + esc(p) + '"><span class="mono">' + esc(name) + '</span>' + (dir ? '<span class="dir mono">' + esc(dir) + '/</span>' : '') + '</div>';
   }
   function loc(rel, line, col) {
     var text = rel + (line ? ':' + line + (col ? ':' + col : '') : '');
@@ -311,7 +321,7 @@ const CLIENT_JS = String.raw`
   function renderTabs() {
     var t = h('div', { class: 'tabs', role: 'tablist' });
     var problems = Object.keys(byGroup).length + findings.filter(function (f) { return f.kind === 'di-cycle'; }).length;
-    [['problems', 'Problems (' + problems + ')'], ['entries', 'Load orders (' + data.entries.length + ')'], ['howto', 'How to read this']].forEach(function (p) {
+    [['problems', 'Problems (' + problems + ')'], ['entries', 'Load orders (' + data.entries.length + ')'], ['howto', 'Guide']].forEach(function (p) {
       t.appendChild(h('button', { role: 'tab', 'aria-selected': String(state.tab === p[0]), class: state.tab === p[0] ? 'active' : '', onclick: function () { state.tab = p[0]; render(); } }, [p[1]]));
     });
     return t;
@@ -361,7 +371,7 @@ const CLIENT_JS = String.raw`
     }).join(' ');
   }
 
-  var ACTION = { 'rewire-barrel': 'Import directly', 'drop-reexport': 'Barrel', 'move-code': 'Break', 'remove-import': 'Remove' };
+  var ACTION = { 'rewire-barrel': 'Import directly', 'drop-reexport': 'Barrel re-export', 'move-code': 'Break import', 'remove-import': 'Remove import' };
   function fixBox(plan, total) {
     if (!plan || !plan.cuts.length) return null;
     var cuts = plan.cuts.map(function (c) {
@@ -402,9 +412,16 @@ const CLIENT_JS = String.raw`
       var ed = h('details', {}, [h('summary', {}, ['Imports inside this group (' + edges.length + '), most cycles first'])]);
       ed.addEventListener('toggle', function () {
         if (!ed.open || ed.querySelector('table')) return;
-        ed.appendChild(h('div', { class: 'tablewrap', style: 'margin-top:6px', html: '<table><thead><tr><th>From</th><th>Imports</th><th>Symbols</th><th>Use</th><th>Cycles</th></tr></thead><tbody>' + edges.map(function (x) {
-          return '<tr><td class="path" title="' + esc(x.e.from) + '">' + esc(short(x.e.from)) + '</td><td class="path" title="' + esc(x.e.to) + '">' + esc(short(x.e.to)) + (x.e.viaBarrel ? ' ' + tag('barrel', 'barrel') : '') + '</td><td class="syms">' + esc(x.e.symbols.slice(0, 5).join(', ')) + (x.e.symbols.length > 5 ? ', …' : '') + '</td><td>' + usageTag(x.e.usage) + '</td><td>' + x.n + '</td></tr>';
-        }).join('') + '</tbody></table>' }));
+        var limit = 25;
+        var draw = function (n) {
+          var old = ed.querySelector('.tablewrap'); if (old) old.remove();
+          var oldBtn = ed.querySelector('button'); if (oldBtn) oldBtn.remove();
+          ed.appendChild(h('div', { class: 'tablewrap', style: 'margin-top:6px', html: '<table><thead><tr><th>From</th><th>Imports</th><th>Use</th><th>Symbols</th><th title="Cycles of this group that use the import">Cycles</th></tr></thead><tbody>' + edges.slice(0, n).map(function (x) {
+            return '<tr><td>' + fileCell(x.e.from) + '</td><td>' + fileCell(x.e.to) + (x.e.viaBarrel ? ' ' + tag('barrel', 'barrel') : '') + '</td><td>' + usageTag(x.e.usage) + '</td><td class="syms">' + esc(x.e.symbols.slice(0, 5).join(', ')) + (x.e.symbols.length > 5 ? ', …' : '') + '</td><td>' + x.n + '</td></tr>';
+          }).join('') + '</tbody></table>' }));
+          if (n < edges.length) ed.appendChild(h('button', { class: 'linkbtn', onclick: function () { draw(edges.length); } }, ['Show all ' + edges.length + ' imports']));
+        };
+        draw(limit);
       });
       foot.appendChild(ed);
     }
@@ -456,7 +473,7 @@ const CLIENT_JS = String.raw`
       }).join(' ') + ' reads <code>' + esc(fp.binding) + '</code></div>';
     }
     return '<div class="codeblock"><div class="loc">' + loc(fp.from, fp.line, fp.column) + '</div><pre>' + esc(fp.snippet) + '</pre>' + via +
-      '<div class="why"><code>' + esc(fp.binding) + '</code> (' + esc(fp.originKind) + ' in <span class="mono">' + esc(fp.originPath || fp.to) + '</span>) is ' + state + '. Context: ' + esc(fp.context) + '.</div></div>';
+      '<div class="why"><code>' + esc(fp.binding) + '</code> (' + esc(fp.originKind) + ' in <span class="mono">' + esc(fp.originPath || fp.to) + '</span>) is ' + state + '. Context: ' + md(fp.context) + '.' + (fp.uncertain ? '<div style="margin-top:4px"><b>Not certain:</b> ' + md(fp.uncertain) + '.</div>' : '') + '</div></div>';
   }
 
   function findingDetail(f) {
@@ -490,10 +507,10 @@ const CLIENT_JS = String.raw`
       el.appendChild(h('div', { class: 'st' }, ['The cycle (' + plural(f.cycle.nodes.length, 'file') + ')']));
       var ev = h('div', { class: 'evidence' });
       ev.appendChild(h('div', { class: 'diagram', html: ring(f.cycle.nodes, f.cycle.edges, failing) + LEGEND }));
-      ev.appendChild(h('div', { class: 'tablewrap', html: '<table><thead><tr><th>File</th><th>imports from</th><th>Symbols</th><th>Use</th></tr></thead><tbody>' + f.cycle.edges.map(function (e) {
+      ev.appendChild(h('div', { class: 'tablewrap', html: '<table><thead><tr><th>File</th><th>imports</th><th>Use</th><th>Symbols · where</th></tr></thead><tbody>' + f.cycle.edges.map(function (e) {
         var isFail = failing.some(function (x) { return x.from === e.from && x.to === e.to; });
-        var where = e.sample && e.usage !== 'none' ? '<div class="muted" style="font-size:11.5px">' + esc(e.sample.context) + ' · L' + e.sample.line + '</div>' : '';
-        return '<tr class="' + (isFail ? 'fail' : '') + '"><td class="path" title="' + esc(e.from) + '">' + esc(short(e.from)) + '</td><td class="path" title="' + esc(e.to) + '">' + esc(short(e.to)) + (e.viaBarrel ? ' ' + tag('barrel', 'barrel') : '') + '</td><td class="syms">' + esc(e.symbols.slice(0, 4).join(', ')) + (e.symbols.length > 4 ? ', …' : '') + where + '</td><td>' + usageTag(e.usage) + (isFail ? ' ⚡' : '') + '</td></tr>';
+        var where = e.sample && e.usage !== 'none' ? '<div class="muted" style="font-size:11.5px">' + md(e.sample.context) + ' · L' + e.sample.line + '</div>' : '';
+        return '<tr class="' + (isFail ? 'fail' : '') + '"><td>' + fileCell(e.from) + '</td><td>' + fileCell(e.to) + (e.viaBarrel ? ' ' + tag('barrel', 'barrel') : '') + '</td><td>' + usageTag(e.usage) + (isFail ? ' ⚡' : '') + '</td><td class="syms">' + esc(e.symbols.slice(0, 4).join(', ')) + (e.symbols.length > 4 ? ', …' : '') + where + '</td></tr>';
       }).join('') + '</tbody></table>' }));
       el.appendChild(ev);
     }
