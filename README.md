@@ -50,39 +50,56 @@ circdeps [root] [options]
 A `circdeps.config.json` in the project root accepts the same keys as the JS API (`include`,
 `exclude`, `entries`, `testEntries`, `noTestEntries`, `maxCyclesPerScc`, `reportTypeOnly`, …).
 
-## Severities
+## Reading the report
+
+Findings are grouped into **problems**: a problem is a cyclic group (files that can all reach each
+other). One group usually causes several findings and one change usually fixes all of them, so every
+problem starts with its **verified fix** – the fewest imports to change so the group becomes acyclic –
+followed by one collapsible row per finding (failing line, call chain, load order, cycle diagram,
+fixes). The text report starts with the same "Problems – fix these first" overview.
 
 | Severity | Meaning |
 | --- | --- |
-| **critical** | Eager use of an uninitialised binding on the load path from the app entry (or a lazy chunk). Crashes. |
-| **high** | Angular DI cycle (NG0200), or a crash that only happens when a spec file is the entry ("works in the app, fails in tests"). |
-| **medium** | Order-dependent: an eager use inside the cyclic group that is currently saved by evaluation order. The next import/spec/barrel change flips it. |
-| **low** | All uses are deferred (function bodies, methods, instance fields, `inject()`), hoisted functions, or barrel/side-effect only. Works, fragile. |
-| **info** | Type-only cycles. TypeScript/esbuild erase these imports; nothing happens at runtime. `import type` changes nothing. |
+| **critical** | A read of an uninitialised binding when the app or a lazy route loads. Crashes. |
+| **high** | The same, but only when a spec file is the entry ("works in the app, fails in tests"); Angular DI cycles (NG0200); a value that is silently `undefined` on app load. |
+| **medium** | Proven to crash when another file of the cycle is imported first (the group is replayed with every member as the first import), or a *possible* crash that depends on something the analysis cannot prove (a branch, an assumed synchronous callback, a file outside the analysed set). The reason is shown. |
+| **low** | One finding per cyclic group that was replayed in every order without a crash. Works, but the next top-level use breaks it. |
+| **info** | Type-only cycles. The compiler erases these imports; nothing happens at runtime. |
 
 ## How the analysis works
 
-1. **Parse** every file with the TypeScript compiler API (no type-check, no `Program`; ~1 s per
-   100k lines). For each imported binding, every reference is classified as
-   *eager* (top-level statements, `extends`, decorator arguments such as `@Component({ imports, providers })`,
-   static fields, enum initialisers, functions/classes invoked at module load),
-   *deferred* (function/method/constructor bodies, instance fields, arrow functions, `forwardRef`),
-   or *type* (annotations, `implements`, generics, `import type`). Shadowing, namespace member access,
-   re-exports (`export *`, `export { x } from`), dynamic `import()`, `require`, `import =` and
-   `emitDecoratorMetadata` (constructor parameter types become values) are handled.
-2. **Graph**: imports that are type-only or unused are marked *erased* (exactly like `isolatedModules`
-   / esbuild do), dynamic imports become lazy entries, barrels are detected and re-exports resolved to
-   the declaring file.
-3. **Cycles**: Tarjan SCCs on the runtime graph, shortest cycle through every edge plus bounded
-   Johnson enumeration, greedy feedback-arc-set "fix plan" per group (verified acyclic).
-4. **Evaluation replay**: depth-first in import order from each entry. On every back edge the tool
-   checks each eager usage: is the binding's *declaring* module (after barrels) done, in progress or
-   not started, and is the binding a hoisted function (`function` declarations are always initialised),
-   a `class`/`const`/`let` (TDZ) or `var`/`enum`/`namespace` (undefined)? Spec files are replayed
-   in isolation, so cycles that only bite under vitest/jest/karma are found too.
-5. **DI graph**: `@Injectable/@Component/@Directive/@Pipe/@NgModule` classes with constructor
-   parameter types, `@Inject(TOKEN)`, `inject(X, { optional, self, skipSelf, host })` in field
-   initialisers/constructors, `providers: [{ provide, useClass, useExisting, deps }]`.
+1. **Parse** every file with the TypeScript compiler API (no type-check; ~1 s for 70k lines). Every
+   reference to an imported binding is classified as
+   *load time* (top-level code, `extends`, decorator arguments such as `@Component({ imports, providers })`,
+   static fields, enum initialisers, callbacks of `.map()`/`.forEach()`/`new Promise()`, functions,
+   static methods and classes invoked while the module loads),
+   *later* (function/method/constructor bodies, instance fields, `inject()`, arrow functions, `forwardRef`),
+   or *type* (annotations, `implements`, generics, `import type`). Per top-level function the parser
+   also records a *footprint* – what it reads when called – so load-time calls can be followed across
+   files.
+2. **What the compiler emits** decides which imports exist at runtime: unused and type-only imports
+   are erased; Angular constructor parameter types are kept (ngtsc references them in the generated
+   factory, including `X | null`); `emitDecoratorMetadata` only adds reads for non-Angular decorators
+   (ngtsc strips Angular decorators first); `const enum` imports are erased only without
+   `isolatedModules`; type-only `export { T } from` and `import x = require()` are erased like tsc does.
+3. **Load-order replay** follows the ES-module algorithm: depth-first in import order, a module body
+   runs once all its imports are done or still loading. At that moment every load-time read is
+   checked against the declaring file (through barrels and `export *`): `class`/`const`/`let` →
+   TDZ `ReferenceError`, `var`/`enum`/`namespace` → `undefined`, `function` declarations → always
+   initialised – unless the called function itself reads something that has not run yet. Entries:
+   `main.ts`, every lazy `import()` chunk, every spec file in isolation, and every file of each cyclic
+   group as a hypothetical first import (proves or refutes order-dependent cycles).
+4. **Never guess**: bindings from packages or unresolvable re-exports never produce a certain finding;
+   files outside the analysed set are opaque modules whose load *time* is known, so reading their
+   re-exports before they load is reported as a possible crash.
+5. **Cycles and fix plans**: Tarjan SCCs, shortest cycle per edge plus bounded Johnson enumeration,
+   greedy feedback-arc-set per group. A barrel import is rewired to the declaring files (as you would
+   fix it) and the plan is only "verified" when the rewired graph is acyclic.
+6. **DI graph**: injectables, components, directives, pipes, NgModules and `InjectionToken`s with
+   constructor parameters, `inject()` (fields, constructor, parameter defaults, `useFactory`,
+   token factories), inherited dependencies, `useClass`/`useExisting`/`deps` (with
+   `[new Optional(), new SkipSelf(), X]` flags), root-level providers (`app.config.ts`) and
+   component-scoped injectors (a root service cannot see a component's providers).
 
 ## Programmatic API
 
@@ -96,7 +113,7 @@ for (const f of result.findings) console.log(f.severity, f.title);
 ## Development
 
 ```bash
-bun test              # unit + end-to-end tests (fixtures/01-04) + performance test (generated 3k-file project)
+bun test              # unit + end-to-end tests (fixtures/01-04, detection precision suites) + performance test (generated 3k-file project)
 bun run typecheck
 bun run build         # emits dist/ for the node CLI in bin/
 bun run gen:fixtures  # regenerate fixtures/05-large-generated
@@ -110,9 +127,13 @@ entries and 10 lazy chunks, in about one second on a laptop.
 
 ## Known limitations
 
-- Call chains across files are not traced: a hoisted function that is *called* at load time in
-  another file and touches an uninitialised binding inside its body is reported as deferred.
-- Scope analysis is syntactic (parameters, `let/const/var/function/class` in enclosing blocks); exotic
-  shadowing may miss a usage.
-- Angular `NgModule` remote scoping (NG3003) is not modelled; standalone components are analysed exactly
-  as the compiler emits them (direct references unless `forwardRef` is used).
+- A higher-order function from another file that invokes a callback it receives
+  (`run(() => A.n)`), and methods called on a fresh instance (`new Svc().get()`), are not followed.
+- Footprints only include code that runs directly when a function is called; reads inside branches are
+  reported as possible crashes, not certain ones.
+- Top-level `await import()` is treated like any dynamic import (a lazy chunk).
+- Spec files are replayed with a fresh module registry each (vitest/jest behaviour). Karma loads all
+  specs into one registry, where the order of spec files decides which test-only crashes occur.
+- Scope analysis is syntactic (parameters and block-level declarations); exotic shadowing may hide a usage.
+- Angular `NgModule` remote scoping (NG3003) is not modelled; standalone components are analysed as
+  the compiler emits them.
