@@ -14,7 +14,7 @@ export interface JsonReport {
   groups: JsonGroup[];
   typeOnlyGroups: JsonGroup[];
   entries: { entry: string; kind: string; evaluated: number; breakages: number }[];
-  fixPlans: { sccId: number; verified: boolean; cuts: { from: string; to: string; symbols: string[]; usage: string; reason: string }[] }[];
+  fixPlans: { sccId: number; verified: boolean; cuts: { from: string; to: string; symbols: string[]; usage: string; action: string; rewiredTo?: string[]; reason: string }[] }[];
   unresolved: { from: string; specifier: string; line: number }[];
 }
 
@@ -35,6 +35,10 @@ export interface JsonFinding {
     from: string;
     to: string;
     symbol: string;
+    /** The uninitialised binding (differs from `symbol` when reached through a call chain). */
+    binding: string;
+    /** Load-time call chain from `symbol()` to the read of `binding`. */
+    via?: { fn: string; path: string; line: number }[];
     line: number;
     column: number;
     snippet: string;
@@ -106,6 +110,8 @@ export const toJsonReport = (result: AnalysisResult, version: string): JsonRepor
       from: rel(fp.from),
       to: rel(fp.to),
       symbol: fp.symbol,
+      binding: fp.binding,
+      via: fp.via?.map((v) => ({ fn: v.fn, path: rel(v.path), line: v.line })),
       line: fp.usage.line,
       column: fp.usage.column,
       snippet: fp.usage.snippet,
@@ -140,7 +146,11 @@ export const toJsonReport = (result: AnalysisResult, version: string): JsonRepor
     groups: result.sccs.map(groupJson),
     typeOnlyGroups: result.typeOnlySccs.map(groupJson),
     entries: result.entries.map((e) => ({ entry: rel(e.entry), kind: e.kind, evaluated: e.evaluatedCount, breakages: e.breakages.length })),
-    fixPlans: result.fixPlans.map((p) => ({ sccId: p.sccId, verified: p.verified, cuts: p.cuts.map((c) => ({ ...c, from: rel(c.from), to: rel(c.to) })) })),
+    fixPlans: result.fixPlans.map((p) => ({
+      sccId: p.sccId,
+      verified: p.verified,
+      cuts: p.cuts.map((c) => ({ ...c, from: rel(c.from), to: rel(c.to), rewiredTo: c.rewiredTo?.map(rel) })),
+    })),
     unresolved: result.graph.unresolved.map((u) => ({ ...u, from: rel(u.from) })),
   };
 };

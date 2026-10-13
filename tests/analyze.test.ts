@@ -62,7 +62,9 @@ describe('fixture 01-basic', () => {
     const files = low.map((f) => cycleFiles(f).sort().join('+')).sort();
     expect(files).toEqual(['services/a.service.ts+services/b.service.ts', 'utils/constants.ts+utils/format.ts']);
     const hoisted = low.find((f) => cycleFiles(f).some((x) => x.endsWith('format.ts')))!;
-    expect(hoisted.title).toContain('cannot break');
+    expect(hoisted.title).toContain('without load-time risk');
+    expect(hoisted.summary).toContain('hoisted function');
+    expect(hoisted.summary).toContain('Replayed with each of the 2 files imported first');
   });
 
   it('reports the interface-only cycle as info and counts erased edges', async () => {
@@ -106,8 +108,11 @@ describe('fixture 02-barrels', () => {
     expect(chain).toEqual(['main.ts', 'user.component.ts', 'index.ts', 'state.ts']);
     const direct = f.suggestions.find((s) => s.kind === 'direct-import')!;
     expect(direct.verified).toBe(true);
-    expect(direct.details?.join('\n')).toContain("from 'src/shared/base.component.ts'");
-    expect(direct.details?.join('\n')).toContain("from 'src/shared/button.component.ts'");
+    // written as specifiers that can be pasted into the importing file
+    expect(direct.details).toEqual([
+      "import { BaseComponent } from '../../shared/base.component';",
+      "import { ButtonComponent } from '../../shared/button.component';",
+    ]);
     // moving UserComponent alone is correctly reported as insufficient
     const move = f.suggestions.find((s) => s.kind === 'move-symbol')!;
     expect(move.verified).toBe(false);
@@ -125,13 +130,15 @@ describe('fixture 02-barrels', () => {
     expect(endsWith(r.fixPlans[0]!.cuts[0]!.to, 'shared/index.ts')).toBe(true);
   });
 
-  it('does not report the extends usage as order-dependent because its origin is outside the group', async () => {
+  it('reports nothing else for the group: no load order makes the extends usage fail, and the plan rewires the barrel', async () => {
     const r = await analyzeFixture('02-barrels');
     expect(findingsOfKind(r, 'latent-cycle')).toHaveLength(0);
-    const low = findingsOfKind(r, 'deferred-cycle');
-    expect(low).toHaveLength(1);
-    expect(low[0]!.suggestions.some((s) => s.kind === 'direct-import' && s.verified)).toBe(true);
-    expect(low[0]!.suggestions.some((s) => s.kind === 'move-symbol')).toBe(false);
+    // the group already has a crash finding, so its harmless cycles are not listed separately
+    expect(findingsOfKind(r, 'deferred-cycle')).toHaveLength(0);
+    const cut = r.fixPlans[0]!.cuts[0]!;
+    expect(cut.action).toBe('rewire-barrel');
+    expect(cut.rewiredTo!.map((p) => p.split('/').pop()).sort()).toEqual(['base.component.ts', 'button.component.ts']);
+    expect(cut.reason).toContain("{ BaseComponent } from '../../shared/base.component'");
   });
 });
 
@@ -178,25 +185,36 @@ describe('fixture 03-angular-app', () => {
     expect(r.diCycles).toHaveLength(1);
   });
 
-  it('reports the enum/const pair as order-dependent (medium) with a verified extraction', async () => {
+  it('proves order-dependent crashes (medium) by replaying the group with each file imported first', async () => {
     const r = await analyzeFixture('03-angular-app');
     const latent = findingsOfKind(r, 'latent-cycle');
-    expect(latent).toHaveLength(1);
-    expect(latent[0]!.severity).toBe('medium');
-    expect(cycleFiles(latent[0]!).sort()).toEqual(['models/defaults.ts', 'models/status.enum.ts']);
-    expect(latent[0]!.suggestions.some((s) => s.kind === 'move-symbol' && s.verified)).toBe(true);
+    expect(latent.every((f) => f.severity === 'medium')).toBe(true);
+    const enumPair = latent.find((f) => cycleFiles(f).some((x) => x.endsWith('status.enum.ts')))!;
+    expect(cycleFiles(enumPair).sort()).toEqual(['models/defaults.ts', 'models/status.enum.ts']);
+    expect(enumPair.failures[0]!.symbol).toBe('Status');
+    expect(enumPair.failures[0]!.entries.map((e) => `${e.kind}:${e.entry.split('/').pop()}`)).toEqual(['hypothetical:status.enum.ts']);
+    expect(enumPair.summary).toContain('if `src/app/shared/models/status.enum.ts` is the first file of this cycle to be imported');
+    expect(enumPair.suggestions.some((s) => s.kind === 'move-symbol' && s.verified)).toBe(true);
+    // The mirror direction of each crash is a separate failure point: fixing only one side leaves it.
+    const mirrorTree = latent.find((f) => f.failures[0]!.symbol === 'TreeNodeComponent')!;
+    expect(mirrorTree.failures[0]!.entries[0]!.entry.endsWith('tree-node.component.ts')).toBe(true);
+    const mirrorAdmin = latent.find((f) => f.failures[0]!.symbol === 'AdminComponent')!;
+    expect(mirrorAdmin.failures[0]!.entries[0]!.entry.endsWith('admin.component.ts')).toBe(true);
+    expect(latent).toHaveLength(3);
   });
 
-  it('treats the constructor-typed service import as erased and the inject() side as deferred', async () => {
+  it('keeps constructor-injected imports alive (Angular factory) so the DI pair is a runtime cycle', async () => {
     const r = await analyzeFixture('03-angular-app');
-    const info = findingsOfKind(r, 'type-only-cycle');
-    expect(info).toHaveLength(1);
-    expect(cycleFiles(info[0]!).sort()).toEqual(['core/auth.service.ts', 'core/user.service.ts']);
-    expect(info[0]!.title).toContain('only through type-only imports');
+    expect(findingsOfKind(r, 'type-only-cycle')).toHaveLength(0);
+    const low = findingsOfKind(r, 'deferred-cycle');
+    expect(low).toHaveLength(1);
+    expect(cycleFiles(low[0]!).sort()).toEqual(['core/auth.service.ts', 'core/user.service.ts']);
     const auth = [...r.graph.modules.values()].find((m) => endsWith(m.path, 'core/auth.service.ts'))!;
     const userImport = auth.imports.find((i) => i.specifierText === './user.service')!;
-    expect(userImport.erased).toBe(true);
-    expect(userImport.specifiers[0]!.effectiveTiming).toBe('type');
+    expect(userImport.erased).toBe(false);
+    expect(userImport.specifiers[0]!.effectiveTiming).toBe('deferred');
+    expect(userImport.specifiers[0]!.usages[0]!.contextKind).toBe('di-factory');
+    expect(auth.imports.find((i) => i.specifierText === './logger.service')!.erased).toBe(false);
   });
 
   it('marks type-only specifiers in symbol lists', async () => {
@@ -208,24 +226,44 @@ describe('fixture 03-angular-app', () => {
 
   it('orders findings by severity and assigns sequential ids', async () => {
     const r = await analyzeFixture('03-angular-app');
-    expect(r.findings.map((f) => f.severity)).toEqual(['critical', 'critical', 'high', 'medium', 'info']);
-    expect(r.findings.map((f) => f.id)).toEqual(['C1', 'C2', 'C3', 'C4', 'C5']);
+    expect(r.findings.map((f) => f.severity)).toEqual(['critical', 'critical', 'high', 'medium', 'medium', 'medium', 'low']);
+    expect(r.findings.map((f) => f.id)).toEqual(['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7']);
+    expect(r.stats.replayedOrders).toBe(8);
   });
 });
 
 describe('fixture 04-decorator-metadata', () => {
-  it('treats constructor parameter types as eager values when emitDecoratorMetadata is on', async () => {
+  it('treats design:type of non-Angular decorated properties as eager values (emitDecoratorMetadata on)', async () => {
     const r = await analyzeFixture('04-decorator-metadata');
     expect(r.options.emitDecoratorMetadata).toBe(true);
     const crit = findingsOfKind(r, 'runtime-break');
     expect(crit).toHaveLength(1);
-    expect(crit[0]!.failures[0]!.usage.contextKind).toBe('decorator-metadata');
-    expect(crit[0]!.failures[0]!.symbol).toBe('AService');
+    const fp = crit[0]!.failures[0]!;
+    expect(fp.usage.contextKind).toBe('decorator-metadata');
+    expect(fp.symbol).toBe('OrderDto');
+    expect(endsWith(fp.from, 'model/customer.dto.ts')).toBe(true);
+    expect(fp.usage.line).toBe(7); // `latestOrder?: OrderDto`; `orders: OrderDto[]` emits Array and is not a read
     expect(crit[0]!.suggestions[0]!.kind).toBe('decorator-metadata');
-    expect(crit[0]!.suggestions[0]!.verified).toBe(true);
+    expect(crit[0]!.suggestions[0]!.text).not.toContain('forwardRef(() =>');
+    // the mirror order (customer.dto imported first) is proven separately
+    const latent = findingsOfKind(r, 'latent-cycle');
+    expect(latent.map((f) => f.failures[0]!.symbol)).toEqual(['CustomerDto']);
   });
 
-  it('downgrades interface parameter types to type-only (no metadata emitted)', async () => {
+  it('does not apply emitDecoratorMetadata to Angular classes (ngtsc strips their decorators first)', async () => {
+    const r = await analyzeFixture('04-decorator-metadata');
+    const a = [...r.graph.modules.values()].find((m) => endsWith(m.path, 'a.service.ts'))!;
+    const b = a.imports.find((i) => i.specifierText === './b.service')!;
+    expect(b.specifiers[0]!.effectiveTiming).toBe('deferred');
+    expect(b.specifiers[0]!.usages[0]!.contextKind).toBe('di-factory');
+    // the services only form a DI cycle and a harmless import cycle
+    expect(findingsOfKind(r, 'di-cycle')).toHaveLength(1);
+    const low = findingsOfKind(r, 'deferred-cycle');
+    expect(low).toHaveLength(1);
+    expect(cycleFiles(low[0]!).sort()).toEqual(['src/a.service.ts', 'src/b.service.ts']);
+  });
+
+  it('downgrades interface parameter types to type-only (nothing is emitted for them)', async () => {
     const r = await analyzeFixture('04-decorator-metadata');
     const a = [...r.graph.modules.values()].find((m) => endsWith(m.path, 'a.service.ts'))!;
     const cfg = a.imports.find((i) => i.specifierText === './config')!;
@@ -234,14 +272,12 @@ describe('fixture 04-decorator-metadata', () => {
     expect(r.stats.erasedEdges).toBe(1);
   });
 
-  it('still reports the DI cycle', async () => {
-    const r = await analyzeFixture('04-decorator-metadata');
-    expect(findingsOfKind(r, 'di-cycle')).toHaveLength(1);
-  });
-
   it('can be overridden to ignore metadata semantics', async () => {
     const r = await analyzeFixture('04-decorator-metadata', { emitDecoratorMetadata: false });
     expect(findingsOfKind(r, 'runtime-break')).toHaveLength(0);
+    expect(findingsOfKind(r, 'latent-cycle')).toHaveLength(0);
+    // the DTO imports become type-only, the services stay a deferred runtime cycle
+    expect(findingsOfKind(r, 'deferred-cycle')).toHaveLength(1);
     expect(findingsOfKind(r, 'type-only-cycle')).toHaveLength(1);
   });
 });

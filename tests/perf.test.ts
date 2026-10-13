@@ -32,7 +32,8 @@ beforeAll(async () => {
   result = await analyze({ root, entries: ['src/main.ts'] });
   elapsed = performance.now() - started;
   console.log(`[perf] ${result.stats.files} files, ${result.stats.loc} lines, ${result.options.testEntries.length} test entries analysed in ${Math.round(elapsed)} ms`, result.stats.phases);
-});
+  // Generous hook timeout: the first run may have to generate the fixture and read ~3k files from a cold disk.
+}, 180_000);
 
 describe('large generated project (fixtures/05-large-generated)', () => {
   it('analyses ~3000 files within the time budget', () => {
@@ -51,6 +52,10 @@ describe('large generated project (fixtures/05-large-generated)', () => {
     expect(f.failures[0]!.usage.contextKind).toBe('extends');
     for (const file of p.files!) expect(cycleHas(f, file)).toBe(true);
     expect(f.failures[0]!.entries.some((e) => e.kind === 'main')).toBe(true);
+    // importing list-item directly would keep the cycle, so the plan cuts base-list's deferred import instead
+    const plan = result.fixPlans.find((p) => p.sccId === f.sccId)!;
+    expect(plan.cuts.map((c) => c.action)).toEqual(['move-code']);
+    expect(plan.cuts[0]!.from.endsWith('/shared/base/base-list.component.ts')).toBe(true);
   });
 
   it('finds the planted mutual standalone component imports', () => {
@@ -105,7 +110,10 @@ describe('large generated project (fixtures/05-large-generated)', () => {
     expect(plan.verified).toBe(true);
     expect(plan.cuts.length).toBeLessThanOrEqual(3);
     // the cut is the barrel-side edge, i.e. the cheapest fix
-    expect(plan.cuts.some((c) => result.graph.modules.get(c.to)?.isBarrel)).toBe(true);
+    // the single cut is the shared util importing the feature barrel – the planted root cause
+    expect(plan.cuts).toHaveLength(1);
+    expect(plan.cuts[0]!.from.endsWith('/shared/utils/registry.util.ts')).toBe(true);
+    expect(result.graph.modules.get(plan.cuts[0]!.to)?.isBarrel).toBe(true);
   });
 
   it('keeps the rest of the project cycle-free', () => {

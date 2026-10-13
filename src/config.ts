@@ -45,6 +45,8 @@ export interface ResolvedConfig {
   maxFindingsPerSeverity: number;
   emitDecoratorMetadata: boolean;
   verbatimModuleSyntax: boolean;
+  /** tsconfig `isolatedModules` (decides whether `const enum` members are inlined across files). */
+  isolatedModules: boolean;
   angular: boolean;
   reportTypeOnly: boolean;
 }
@@ -138,6 +140,7 @@ export const resolveConfig = (opts: CircdepsOptions): ResolvedConfig => {
     maxFindingsPerSeverity: merged.maxFindingsPerSeverity ?? 40,
     emitDecoratorMetadata:
       merged.emitDecoratorMetadata ?? Boolean(compilerOptions.emitDecoratorMetadata),
+    isolatedModules: Boolean(compilerOptions.isolatedModules || compilerOptions.verbatimModuleSyntax),
     verbatimModuleSyntax: Boolean(
       compilerOptions.verbatimModuleSyntax || compilerOptions.preserveValueImports,
     ),

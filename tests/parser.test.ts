@@ -660,9 +660,23 @@ import { BService } from './b';
 @Injectable()
 export class S { constructor(private b: BService) {} }
 `;
+  // A non-Angular decorator (class-transformer, typedi, NestJS-style …): TypeScript emits design:paramtypes.
+  const customSrc = `
+import { Service } from 'some-di-lib';
+import { BService } from './b';
+@Service()
+export class S { constructor(private b: BService) {} }
+`;
 
-  it('20a. emitDecoratorMetadata: constructor param type of decorated class is eager', () => {
+  it('20a0. emitDecoratorMetadata is not emitted for Angular-decorated classes (ngtsc strips the decorators first)', () => {
     const mod = parse(ctorSrc, { emitDecoratorMetadata: true });
+    const s = spec(mod, 'BService');
+    expect(s.effectiveTiming).toBe('deferred');
+    expect(s.usages[0]!.contextKind).toBe('di-factory');
+  });
+
+  it('20a. emitDecoratorMetadata: constructor param type of a class with a non-Angular decorator is eager', () => {
+    const mod = parse(customSrc, { emitDecoratorMetadata: true });
     const s = spec(mod, 'BService');
     expect(s.effectiveTiming).toBe('eager');
     expect(s.usages).toHaveLength(1);
@@ -670,11 +684,30 @@ export class S { constructor(private b: BService) {} }
     expect(record(mod, './b').erased).toBe(false);
   });
 
-  it('20b. without emitDecoratorMetadata the same param type is type-only', () => {
+  it('20b. without emitDecoratorMetadata an Angular constructor param is a deferred factory reference (ngtsc factory)', () => {
     const mod = parse(ctorSrc, { emitDecoratorMetadata: false });
     const s = spec(mod, 'BService');
-    expect(s.effectiveTiming).toBe('type');
-    expect(record(mod, './b').erased).toBe(true);
+    expect(s.effectiveTiming).toBe('deferred');
+    expect(s.usages).toHaveLength(1);
+    expect(s.usages[0]!.contextKind).toBe('di-factory');
+    expect(record(mod, './b').erased).toBe(false);
+  });
+
+  it('20b2. non-Angular decorated classes and @Inject() params keep constructor types type-only', () => {
+    const mod = parse(`
+import { Inject, Injectable } from '@angular/core';
+import { Plain } from './plain';
+import { Tok, TokType } from './tok';
+function Custom(): ClassDecorator { return () => {}; }
+@Custom()
+export class A { constructor(private p: Plain) {} }
+@Injectable()
+export class B { constructor(@Inject(Tok) private t: TokType) {} }
+`);
+    expect(spec(mod, 'Plain').effectiveTiming).toBe('type');
+    expect(record(mod, './plain').erased).toBe(true);
+    expect(spec(mod, 'TokType').effectiveTiming).toBe('type');
+    expect(spec(mod, 'Tok').effectiveTiming).toBe('deferred');
   });
 
   it('20c. undecorated class stays type-only even with emitDecoratorMetadata', () => {
@@ -692,13 +725,17 @@ export class S { constructor(private b: BService) {} }
     const mod = parse(
       `
 import { Component, Input } from '@angular/core';
+import { Expose } from 'class-transformer';
 import { Foo } from './foo';
 import { Plain } from './plain';
+import { NgOnly } from './ng-only';
 @Component({})
-export class C { @Input() x: Foo; y: Plain; }
+export class C { @Expose() x: Foo; y: Plain; @Input() z: NgOnly; }
 `,
       { emitDecoratorMetadata: true },
     );
+    // Angular member decorators are stripped by ngtsc: no design:type for `z`
+    expect(spec(mod, 'NgOnly').effectiveTiming).toBe('type');
     const foo = spec(mod, 'Foo');
     expect(foo.effectiveTiming).toBe('eager');
     expect(foo.usages[0]!.contextKind).toBe('decorator-metadata');
@@ -759,7 +796,7 @@ export class C {}
     expect(ng.providers).toHaveLength(3);
     expect(ng.providers[0]).toMatchObject({ provide: 'X' });
     expect(ng.providers[1]).toMatchObject({ provide: 'Y', useClass: 'Z' });
-    expect(ng.providers[2]).toMatchObject({ provide: 'W', deps: ['Q'] });
+    expect(ng.providers[2]).toMatchObject({ provide: 'W', deps: [{ token: 'Q', flags: {} }] });
     expect(ng.imports).toEqual(['A', 'B']);
   });
 
@@ -777,13 +814,30 @@ export class S {
     expect(mod.angular[0]!.deps).toEqual([]);
   });
 
-  it('21d. a class without an Angular decorator yields no angular entry', () => {
+  it('21d. an undecorated class is only recorded (as a potential base class) when it injects something', () => {
     const mod = parse(`
 import { inject } from '@angular/core';
 import { Foo } from './deps';
-export class Plain { private f = inject(Foo); }
+export class Base { private f = inject(Foo); }
+export class Plain { x = 1; }
 `);
-    expect(mod.angular).toEqual([]);
+    expect(mod.angular.map((a) => [a.name, a.decorator])).toEqual([['Base', 'none']]);
+    expect(mod.angular[0]!.deps.map((d) => d.token)).toEqual(['Foo']);
+  });
+
+  it('21f. provider deps keep resolution flags; nullable parameter types are unwrapped', () => {
+    const mod = parse(`
+import { Component, Injectable, Optional, SkipSelf } from '@angular/core';
+import { Registry, Parent } from './deps';
+@Component({ providers: [{ provide: Registry, useFactory: (p: Registry) => p ?? new Registry(), deps: [[new Optional(), new SkipSelf(), Registry]] }] })
+export class C {}
+@Injectable()
+export class S { constructor(@Optional() p: Parent | null) {} }
+`);
+    const c = mod.angular.find((a) => a.name === 'C')!;
+    expect(c.providers[0]!.deps).toEqual([{ token: 'Registry', flags: { optional: true, skipSelf: true } }]);
+    const s = mod.angular.find((a) => a.name === 'S')!;
+    expect(s.deps.map((d) => [d.token, d.flags.optional])).toEqual([['Parent', true]]);
   });
 
   it('21e. angular: false disables extraction', () => {

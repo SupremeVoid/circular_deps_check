@@ -6,8 +6,11 @@ import type {
   DiCycle,
   EdgeNote,
   EntryEvaluation,
+  EntryKind,
+  FailingUsage,
   FailurePoint,
   Finding,
+  FindingKind,
   FixPlan,
   GraphEdge,
   ModuleGraph,
@@ -25,13 +28,15 @@ import {
   adjacencyFrom,
   enumerateCycles,
   shortestCycleThroughEdge,
+  reaches,
+  shortestPath,
   stronglyConnectedComponents,
   subgraph,
   type Adjacency,
 } from './cycles.js';
-import { evaluateAll } from './evaluate.js';
+import { evaluateAll, evaluateHypothetical } from './evaluate.js';
 import { buildDiGraph, findDiCycles } from './di.js';
-import { suggestForCycle, suggestForDiCycle, type SuggestContext } from './suggest.js';
+import { importSpecifier, suggestForCycle, suggestForDiCycle, type SuggestContext } from './suggest.js';
 import { relativeTo } from './util/paths.js';
 
 export interface AnalyzeProgress {
@@ -71,6 +76,7 @@ export const analyze = async (opts: CircdepsOptions = {}, progress?: AnalyzeProg
       resolver,
       emitDecoratorMetadata: config.emitDecoratorMetadata,
       verbatimModuleSyntax: config.verbatimModuleSyntax,
+      isolatedModules: config.isolatedModules,
       angular: config.angular,
     };
     for (const file of files) {
@@ -85,7 +91,7 @@ export const analyze = async (opts: CircdepsOptions = {}, progress?: AnalyzeProg
     return map;
   });
 
-  const graph = time('graph', () => buildGraph(root, modules));
+  const graph = time('graph', () => buildGraph(root, modules, { verbatimModuleSyntax: config.verbatimModuleSyntax }));
 
   const t1 = performance.now();
   progress?.('entries');
@@ -121,16 +127,19 @@ export const analyze = async (opts: CircdepsOptions = {}, progress?: AnalyzeProg
   });
 
   const entries = time('evaluate', () => evaluateAll(graph, mainEntries, testEntries));
+  // Prove or refute order-dependent crashes: replay each cyclic group with every member imported first.
+  const replays = time('replay-groups', () => evaluateHypothetical(graph, sccs.map((s) => s.nodes)));
 
   const diCycles = time('di', () => (config.angular ? findDiCycles(buildDiGraph(graph)) : []));
 
   const suggestCtx: SuggestContext = { graph, adj: runtimeAdj, exportCache: new Map() };
 
-  const findings = time('findings', () => composeFindings(graph, runtimeAdj, sccs, sccByNode, typeOnlySccs, entries, diCycles, suggestCtx, config));
+  const findings = time('findings', () => composeFindings(graph, runtimeAdj, sccs, sccByNode, typeOnlySccs, [...entries, ...replays], diCycles, suggestCtx, config));
 
-  const fixPlans = time('fix-plans', () => sccs.map((s) => planFixes(graph, runtimeAdj, s)));
+  const fixPlans = time('fix-plans', () => sccs.map((s) => planFixes(graph, runtimeAdj, s, suggestCtx.exportCache)));
 
   const stats = computeStats(graph, sccs, typeOnlySccs, diCycles, entries, findings, started, phases);
+  stats.replayedOrders = replays.length;
 
   return {
     root,
@@ -199,6 +208,28 @@ const edgeNoteFor = (edge: GraphEdge): EdgeNote => {
   return { from: edge.from, to: edge.to, usage: edge.usage, symbols: edgeSymbols(edge), viaBarrel: edge.viaBarrel, sample };
 };
 
+const symbolOf = (f: FailingUsage): string => (f.specifier.imported === '*' ? `${f.specifier.local}.${f.usage.member ?? '*'}` : f.specifier.imported);
+
+const ENTRY_RANK: Record<EntryKind, number> = { main: 0, lazy: 1, test: 2, hypothetical: 3 };
+
+/**
+ * The cycle that makes a failure possible: `from` reads a binding of `origin` while `origin` is
+ * still loading, so `origin` reaches `from` and `from` reaches `origin` (via `to`). Prefer that
+ * cycle; fall back to the shortest cycle through the import edge.
+ */
+const failureCycle = (adj: Adjacency, fp: FailurePoint, originInProgress: boolean): string[] => {
+  const origin = fp.originPath;
+  if (origin && originInProgress && origin !== fp.from) {
+    const there = shortestPath(adj, fp.to, origin);
+    const back = shortestPath(adj, origin, fp.from);
+    if (there && back) {
+      const nodes = [fp.from, ...there, ...back.slice(1, -1)];
+      if (new Set(nodes).size === nodes.length) return nodes;
+    }
+  }
+  return shortestCycleThroughEdge(adj, fp.from, fp.to) ?? [fp.from, fp.to];
+};
+
 const composeFindings = (
   graph: ModuleGraph,
   adj: Adjacency,
@@ -213,14 +244,16 @@ const composeFindings = (
   const rel = (p: string): string => relativeTo(graph.root, p);
   const findings: Finding[] = [];
 
-  // 1. Load-time failures ------------------------------------------------------------------------
+  // 1. Load-time failures (real entries + hypothetical "imported first" orders) ------------------
   const failuresByEdge = new Map<string, Map<string, FailurePoint>>();
+  const inProgress = new Map<FailurePoint, boolean>();
   for (const ev of entries) {
     for (const b of ev.breakages) {
       for (const f of b.failing) {
         const edgeKey = `${b.from}\0${b.to}`;
-        const symbol = f.specifier.imported === '*' ? `${f.specifier.local}.${f.usage.member ?? '*'}` : f.specifier.imported;
-        const key = `${symbol}\0${f.usage.line}:${f.usage.column}`;
+        const symbol = symbolOf(f);
+        const viaKey = (f.via ?? []).map((s) => `${s.path}#${s.fn}`).join('>');
+        const key = `${symbol}\0${f.binding}\0${viaKey}\0${f.usage.line}:${f.usage.column}`;
         let perEdge = failuresByEdge.get(edgeKey);
         if (!perEdge) {
           perEdge = new Map();
@@ -228,35 +261,56 @@ const composeFindings = (
         }
         let fp = perEdge.get(key);
         if (!fp) {
-          fp = { from: b.from, to: b.to, usage: f.usage, symbol, originPath: f.originPath, originKind: f.originKind, state: f.state, entries: [] };
+          fp = { from: b.from, to: b.to, usage: f.usage, symbol, binding: f.binding, via: f.via, originPath: f.originPath, originKind: f.originKind, state: f.state, entries: [] };
           perEdge.set(key, fp);
         }
-        if (!fp.entries.some((e) => e.entry === ev.entry)) fp.entries.push({ entry: ev.entry, kind: ev.kind, chain: b.chain });
+        if (f.originState === 'in-progress') inProgress.set(fp, true);
+        if (!fp.entries.some((e) => e.entry === ev.entry && e.kind === ev.kind)) fp.entries.push({ entry: ev.entry, kind: ev.kind, chain: b.chain });
       }
     }
   }
 
-  const failingEdgeKeys = new Set(failuresByEdge.keys());
-  for (const [edgeKey, perEdge] of failuresByEdge) {
-    const [from, to] = edgeKey.split('\0') as [string, string];
-    const failures = [...perEdge.values()].sort((a, b) => a.usage.line - b.usage.line);
-    const scc = sccByNode.get(from);
-    const cycNodes = shortestCycleThroughEdge(adj, from, to) ?? [from, to];
-    const cycle = materializeCycle(graph, cycNodes);
-    const breaksInApp = failures.some((f) => f.entries.some((e) => e.kind !== 'test'));
+  for (const perEdge of failuresByEdge.values()) {
+    const failures = [...perEdge.values()].sort((a, b) => a.usage.line - b.usage.line || a.usage.column - b.usage.column);
+    for (const fp of failures) fp.entries.sort((a, b) => ENTRY_RANK[a.kind] - ENTRY_RANK[b.kind] || a.entry.localeCompare(b.entry));
+    const kinds = new Set(failures.flatMap((f) => f.entries.map((e) => e.kind)));
+    const kind: FindingKind = kinds.has('main') || kinds.has('lazy') ? 'runtime-break' : kinds.has('test') ? 'test-break' : 'latent-cycle';
+    // Hypothetical orders only matter when no real entry triggers the failure.
+    if (kind !== 'latent-cycle') for (const fp of failures) fp.entries = fp.entries.filter((e) => e.kind !== 'hypothetical');
     const first = failures[0]!;
-    const symbols = [...new Set(failures.map((f) => f.symbol))];
-    const errorText = first.state === 'tdz'
-      ? `ReferenceError: Cannot access '${first.symbol}' before initialization`
-      : `TypeError: '${first.symbol}' is undefined`;
+    const from = first.from;
+    const scc = sccByNode.get(from);
+    const cycle = materializeCycle(graph, failureCycle(adj, first, inProgress.get(first) ?? false));
+    const symbols = [...new Set(failures.map((f) => (f.via ? `${f.symbol}()` : f.symbol)))];
+    // `var`/`enum`/`namespace` bindings are `undefined` before their module runs: reading a member
+    // or calling throws, merely capturing the value (`[MyEnum]`) silently stores `undefined`.
+    const throws = first.state === 'tdz' || first.via !== undefined || first.usage.call === true || first.usage.access !== undefined;
+    const errorText =
+      first.state === 'tdz'
+        ? `ReferenceError: Cannot access '${first.binding}' before initialization`
+        : throws
+          ? `TypeError: '${first.binding}' is undefined at this point`
+          : `'${first.binding}' is still undefined here – no error at load time, but the captured value is silently missing`;
+    const origin = rel(first.originPath ?? first.to);
+    const what = first.via
+      ? `calls \`${first.symbol}()\` at load time, which reads \`${first.binding}\` (${first.originKind} in \`${origin}\`)`
+      : `reads \`${first.symbol}\` (${first.originKind} declared in \`${origin}\`)`;
+    const when =
+      kind === 'latent-cycle'
+        ? ` if \`${rel(first.entries[0]!.entry)}\` is the first file of this cycle to be imported`
+        : '';
+    const titleWhat = first.via ? `\`${first.symbol}()\` reads \`${first.binding}\` before initialisation` : `\`${symbols.join('`, `')}\` read before initialisation`;
     findings.push({
       id: '',
-      severity: breaksInApp ? 'critical' : 'high',
-      kind: breaksInApp ? 'runtime-break' : 'test-break',
-      title: breaksInApp
-        ? `Load-time crash: \`${symbols.join('`, `')}\` used before initialisation in \`${rel(from)}\``
-        : `Crashes when loaded from tests: \`${symbols.join('`, `')}\` used before initialisation in \`${rel(from)}\``,
-      summary: `${rel(from)}:${first.usage.line} touches \`${first.symbol}\` (${first.originKind} from \`${rel(first.originPath ?? to)}\`) while that module is still initialising → ${errorText}.`,
+      severity: kind === 'runtime-break' ? 'critical' : kind === 'test-break' ? 'high' : 'medium',
+      kind,
+      title:
+        kind === 'runtime-break'
+          ? `Load-time crash: ${titleWhat} in \`${rel(from)}\``
+          : kind === 'test-break'
+            ? `Crashes when loaded from tests: ${titleWhat} in \`${rel(from)}\``
+            : `Order-dependent crash: ${titleWhat} in \`${rel(from)}\``,
+      summary: `\`${rel(from)}:${first.usage.line}\` ${what} before that module has finished loading${when} → ${errorText}.${kind === 'latent-cycle' ? ' The current entry points happen to load this cycle in a safe order.' : ''}`,
       sccId: scc?.id ?? 0,
       cycle,
       failures,
@@ -275,8 +329,8 @@ const composeFindings = (
       kind: 'di-cycle',
       title: `Angular DI cycle (NG0200): ${names.join(' → ')} → ${names[0]}`,
       summary: dc.certain
-        ? `Each of these injectables needs the next one during construction; Angular throws "NG0200: Circular dependency in DI detected" when the first one is instantiated.`
-        : `Constructor dependencies form a cycle; one edge uses @SkipSelf/@Host so it may resolve from a parent injector – verify manually.`,
+        ? `Each of these injectables needs the next one while it is being constructed; Angular throws "NG0200: Circular dependency in DI detected" the first time one of them is injected.`
+        : `Constructor dependencies form a cycle, but one edge uses @SkipSelf/@Host and may resolve from a parent injector – verify manually.`,
       sccId: firstPath ? (sccByNode.get(firstPath)?.id ?? 0) : 0,
       diCycle: dc,
       failures: [],
@@ -285,75 +339,32 @@ const composeFindings = (
     });
   }
 
-  // 3. Remaining cycles in runtime SCCs ----------------------------------------------------------
+  // 3. Runtime cycle groups that cannot crash under any load order (one finding per group) --------
+  const groupsWithFailures = new Set(findings.filter((f) => f.failures.length > 0).map((f) => f.sccId));
   for (const scc of sccs) {
-    let latent = 0;
-    let deferred = 0;
-    let skippedLatent = 0;
-    let skippedDeferred = 0;
-    for (const cycle of scc.cycles) {
-      if (cycle.edges.some((e) => failingEdgeKeys.has(`${e.from}\0${e.to}`))) continue;
-      // An eager edge can only break if the eagerly used binding is declared inside this group
-      // (only then can its module still be initialising when the importer runs) and is not a
-      // hoisted function.
-      const eagerEdges = cycle.edges.filter((e) => e.usage === 'eager' && eagerUsageInsideGroup(graph, e, scc, sctx.exportCache));
-      if (eagerEdges.length > 0) {
-        if (latent >= 8) {
-          skippedLatent++;
-          continue;
-        }
-        latent++;
-        const e = eagerEdges[0]!;
-        const note = edgeNoteFor(e);
-        const sym = note.sample?.symbol ?? note.symbols[0] ?? '?';
-        findings.push({
-          id: '',
-          severity: 'medium',
-          kind: 'latent-cycle',
-          title: `Order-dependent cycle: \`${rel(e.from)}\` uses \`${sym}\` from \`${rel(e.to)}\` at load time`,
-          summary: `Works with the current entry points only because \`${rel(e.from)}\` happens to be evaluated after \`${rel(e.to)}\`. Any import that pulls in \`${rel(e.to)}\` first (a spec, a new feature, a barrel reorder) turns this into "${'Cannot access'} '${sym}' before initialization".`,
-          sccId: scc.id,
-          cycle,
-          failures: [],
-          suggestions: suggestForCycle(sctx, cycle, [], new Set(eagerEdges.map((x) => `${x.from}\0${x.to}`))),
-          edgeNotes: cycle.edges.map(edgeNoteFor),
-        });
-      } else {
-        if (deferred >= 3) {
-          skippedDeferred++;
-          continue;
-        }
-        deferred++;
-        const anyBinding = cycle.edges.some((e) => e.usage === 'deferred' || e.usage === 'eager');
-        const hoistedOnly = cycle.edges.some((e) => e.usage === 'eager');
-        findings.push({
-          id: '',
-          severity: 'low',
-          kind: 'deferred-cycle',
-          title: hoistedOnly
-            ? `Cycle whose eager usages cannot break (hoisted functions / bindings from outside the group): ${cycle.nodes.map(rel).join(' → ')}`
-            : anyBinding
-              ? `Cycle with deferred usage only: ${cycle.nodes.map(rel).join(' → ')}`
-              : `Cycle without binding usage (re-exports/side effects): ${cycle.nodes.map(rel).join(' → ')}`,
-          summary: hoistedOnly
-            ? 'Bindings used at load time are either function declarations (hoisted, always initialised) or declared in files outside this cyclic group, so the load order cannot break it. Still worth untangling: it hides real cycles and blocks tree-shaking.'
-            : anyBinding
-              ? 'Imported bindings are only touched inside functions, methods or instance fields, so module loading succeeds. Fragile: the first top-level use will crash.'
-              : 'Modules import each other only through barrels/side-effect imports. Harmless at runtime but it inflates the load graph and hides real cycles.',
-          sccId: scc.id,
-          cycle,
-          failures: [],
-          suggestions: suggestForCycle(sctx, cycle, []),
-          edgeNotes: cycle.edges.map(edgeNoteFor),
-        });
-      }
-    }
-    if (skippedLatent > 0 || skippedDeferred > 0) {
-      const last = findings[findings.length - 1];
-      if (last && last.sccId === scc.id) {
-        last.summary += ` (${skippedLatent + skippedDeferred} more cycles in group #${scc.id} not listed individually – see the group view.)`;
-      }
-    }
+    if (groupsWithFailures.has(scc.id)) continue;
+    const cycle = scc.cycles[0];
+    if (!cycle) continue;
+    const edges = cycle.edges;
+    const anyEager = scc.cycles.some((c) => c.edges.some((e) => e.usage === 'eager'));
+    const anyDeferred = scc.cycles.some((c) => c.edges.some((e) => e.usage === 'deferred'));
+    const reason = anyEager
+      ? 'Every load-time read inside the group targets a hoisted function or a binding declared outside the group, so no import order can hit an uninitialised value.'
+      : anyDeferred
+        ? 'Imported bindings are only used inside functions, methods, constructors or instance fields, so nothing is read while the modules load.'
+        : 'The files only reach each other through barrel re-exports or side-effect imports.';
+    findings.push({
+      id: '',
+      severity: 'low',
+      kind: 'deferred-cycle',
+      title: `Import cycle without load-time risk: ${scc.nodes.length} files (group #${scc.id})`,
+      summary: `Replayed with each of the ${scc.nodes.length} files imported first – none crashes. ${reason} Still worth untangling: the next top-level use (a static field, a route array, \`extends\`) turns it into a crash.`,
+      sccId: scc.id,
+      cycle,
+      failures: [],
+      suggestions: suggestForCycle(sctx, cycle, []),
+      edgeNotes: edges.map(edgeNoteFor),
+    });
   }
 
   // 4. Type-only cycles --------------------------------------------------------------------------
@@ -370,7 +381,7 @@ const composeFindings = (
           ? `Type-only cycle (erased at compile time): ${scc.nodes.map(rel).join(', ')}`
           : `Cycle only through type-only imports (erased at compile time): ${scc.nodes.map(rel).join(', ')}`,
         summary: allErased
-          ? 'These files reference each other only in type positions. TypeScript/esbuild remove these imports, so nothing is evaluated at runtime. No action needed – converting to `import type` changes nothing.'
+          ? 'These files reference each other only in type positions. The compiler removes these imports, so nothing is evaluated at runtime. No action needed – converting to `import type` changes nothing.'
           : `At runtime only one direction exists: ${erasedEdges.map((e) => `\`${rel(e.from)}\` → \`${rel(e.to)}\``).join(', ')} ${erasedEdges.length === 1 ? 'is' : 'are'} used purely as types and erased by the compiler. No load-time cycle – no action needed.`,
         sccId: scc.id,
         cycle,
@@ -381,12 +392,19 @@ const composeFindings = (
     }
   }
 
+  const entryWeight = (f: Finding): number => f.failures.reduce((n, fp) => n + fp.entries.length, 0);
   findings.sort((a, b) => {
     const d = SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity];
     if (d !== 0) return d;
-    const ea = a.failures.reduce((n, f) => n + f.entries.length, 0);
-    const eb = b.failures.reduce((n, f) => n + f.entries.length, 0);
-    if (ea !== eb) return eb - ea;
+    if (a.sccId !== b.sccId && a.failures.length > 0 && b.failures.length > 0) {
+      // keep findings of one group together, biggest impact first
+      const ga = findings.filter((x) => x.sccId === a.sccId).length;
+      const gb = findings.filter((x) => x.sccId === b.sccId).length;
+      if (ga !== gb) return gb - ga;
+      return a.sccId - b.sccId;
+    }
+    const ew = entryWeight(b) - entryWeight(a);
+    if (ew !== 0) return ew;
     const la = a.cycle?.nodes.length ?? a.diCycle?.nodes.length ?? 0;
     const lb = b.cycle?.nodes.length ?? b.diCycle?.nodes.length ?? 0;
     if (la !== lb) return la - lb;
@@ -396,41 +414,62 @@ const composeFindings = (
   return findings;
 };
 
-/** True when some eager usage on the edge resolves to a non-hoisted binding declared inside `scc`. */
-const eagerUsageInsideGroup = (graph: ModuleGraph, edge: GraphEdge, scc: Scc, cache: Map<string, ResolvedExport | null>): boolean => {
+/**
+ * Greedy feedback-arc-set over a cyclic group: repeatedly cut the edge that lies on the most
+ * shortest cycles, weighted by how cheap the code change is. A barrel import is not deleted but
+ * *rewired* to the files that declare the used symbols (that is what the developer will do), and
+ * the plan is only "verified" when the rewired graph is acyclic.
+ */
+const planFixes = (graph: ModuleGraph, adj: Adjacency, scc: Scc, cache: Map<string, ResolvedExport | null>): FixPlan => {
+  const rel = (p: string): string => relativeTo(graph.root, p);
   const members = new Set(scc.nodes);
-  for (const r of edge.records) {
-    if (r.erased || r.kind === 'dynamic') continue;
-    for (const s of r.specifiers) {
-      for (const u of s.usages) {
-        if (u.timing !== 'eager') continue;
-        const name = s.imported === '*' ? u.member : s.imported;
-        if (name === undefined) continue;
-        const resolved = resolveExport(graph, edge.to, name, cache);
-        if (!resolved) return true; // unknown: assume the worst
-        if (resolved.record.hoisted || resolved.record.kind === 'function') continue;
-        if (resolved.record.kind === 'type' || resolved.record.kind === 'interface') continue;
-        if (members.has(resolved.originPath)) return true;
+  const sub = subgraph(adj, scc.nodes);
+  const introduced = new Set<string>(); // edges created by rewiring a barrel import
+  const cuts: FixPlan['cuts'] = [];
+
+  const originsOf = (e: GraphEdge): Map<string, string[]> => {
+    const out = new Map<string, string[]>();
+    for (const r of e.records) {
+      if (r.erased || r.kind === 'dynamic') continue;
+      for (const s of r.specifiers) {
+        if (s.effectiveTiming === 'unused' || s.effectiveTiming === 'type') continue;
+        const names = s.imported === '*' ? [...new Set(s.usages.map((u) => u.member).filter((m): m is string => Boolean(m)))] : [s.imported];
+        for (const n of names) {
+          const res = resolveExport(graph, e.to, n, cache);
+          const origin = res?.originPath ?? e.to;
+          out.set(origin, [...(out.get(origin) ?? []), n]);
+        }
       }
     }
-  }
-  return false;
-};
+    return out;
+  };
 
-/** Greedy feedback-arc-set: repeatedly remove the edge that participates in most shortest cycles. */
-const planFixes = (graph: ModuleGraph, adj: Adjacency, scc: Scc): FixPlan => {
-  const sub = subgraph(adj, scc.nodes);
-  const cuts: FixPlan['cuts'] = [];
-  const cost = (e: GraphEdge | undefined): number => {
+  /** Rewiring a barrel import only helps if no declaring file inside the group leads back to the importer. */
+  const rewireHelps = (from: string, to: string, e: GraphEdge): boolean => {
+    const without = subgraph(sub, scc.nodes);
+    without.get(from)?.delete(to);
+    for (const origin of originsOf(e).keys()) {
+      if (origin === to || !members.has(origin)) continue;
+      if (origin === from || reaches(without, origin, from)) return false;
+    }
+    return true;
+  };
+
+  const cost = (from: string, to: string): number => {
+    const key = `${from}\0${to}`;
+    if (introduced.has(key)) return 3;
+    const e = graph.out.get(from)?.get(to);
     if (!e) return 5;
-    if (e.viaBarrel) return 0.5;
+    if (graph.modules.get(from)?.isBarrel) return 6; // removing a re-export changes the barrel's public API
+    if (e.viaBarrel && rewireHelps(from, to, e)) return 0.5;
     if (e.usage === 'none' || e.usage === 'type') return 1;
     if (e.usage === 'deferred') return 2;
     return 3;
   };
-  for (let iter = 0; iter < 60; iter++) {
+
+  for (let iter = 0; iter < 80; iter++) {
     const comps = stronglyConnectedComponents(sub);
-    if (comps.length === 0) return { sccId: scc.id, cuts, verified: true };
+    if (comps.length === 0) break;
     const counts = new Map<string, number>();
     for (const comp of comps) {
       const s = subgraph(sub, comp);
@@ -446,25 +485,74 @@ const planFixes = (graph: ModuleGraph, adj: Adjacency, scc: Scc): FixPlan => {
       }
     }
     let best: { key: string; score: number } | null = null;
-    for (const [key, count] of counts) {
+    for (const [key, count] of [...counts].sort((a, b) => a[0].localeCompare(b[0]))) {
       const [from, to] = key.split('\0') as [string, string];
-      const e = graph.out.get(from)?.get(to);
-      const score = count / (1 + cost(e));
+      const score = count / (1 + cost(from, to));
       if (!best || score > best.score) best = { key, score };
     }
     if (!best) break;
     const [from, to] = best.key.split('\0') as [string, string];
-    const e = graph.out.get(from)?.get(to);
+    const e = introduced.has(best.key) ? undefined : graph.out.get(from)?.get(to);
     sub.get(from)?.delete(to);
+    const fromBarrel = Boolean(graph.modules.get(from)?.isBarrel);
+
+    if (e && e.viaBarrel && !fromBarrel && rewireHelps(from, to, e)) {
+      const origins = originsOf(e);
+      const rewiredTo: string[] = [];
+      for (const origin of origins.keys()) {
+        if (origin === from || origin === to) continue;
+        rewiredTo.push(origin);
+        if (members.has(origin) && !sub.get(from)?.has(origin)) {
+          sub.get(from)?.add(origin);
+          introduced.add(`${from}\0${origin}`);
+        }
+      }
+      const imports = [...origins].filter(([o]) => o !== to).map(([o, names]) => `{ ${[...new Set(names)].join(', ')} } from '${importSpecifier(from, o)}'`);
+      cuts.push({
+        from,
+        to,
+        symbols: edgeSymbols(e),
+        usage: e.usage,
+        action: 'rewire-barrel',
+        rewiredTo,
+        reason: imports.length > 0 ? `import ${imports.join(', ')} instead of the barrel` : 'only loads the barrel for side effects – import the concrete file or drop the import',
+      });
+      continue;
+    }
+
+    const symbols = e ? edgeSymbols(e) : [];
+    const usage = e?.usage ?? 'eager';
+    const sample = e ? strongestSample(e) : undefined;
     cuts.push({
       from,
       to,
-      symbols: e ? edgeSymbols(e) : [],
-      usage: e?.usage ?? 'none',
-      reason: e?.viaBarrel ? 'barrel import – replace with direct imports' : e?.usage === 'eager' ? 'eager usage – move the symbol or defer the access' : e?.usage === 'deferred' ? 'deferred usage – can be replaced with lazy access / DI' : 'no binding usage – drop the import',
+      symbols,
+      usage,
+      action: fromBarrel ? 'drop-reexport' : usage === 'none' ? 'remove-import' : 'move-code',
+      reason: fromBarrel
+        ? `barrel re-export: drop \`export … from '${rel(to)}'\` here, or keep files of this group from importing the barrel`
+        : introduced.has(best.key)
+          ? `direct dependency created by the previous rewiring: move the used symbols out of \`${rel(to)}\``
+          : usage === 'eager' && sample?.contextKind === 'decorator' && ['imports', 'declarations', 'exports'].includes(sample.property ?? '')
+            ? `used in the @${sample.decorator ?? 'Component'}() \`${sample.property}\` array (L${sample.line}): wrap it in \`forwardRef(() => …)\` (defers the read, keeps the import) or move the shared piece out`
+            : usage === 'eager'
+            ? `used at load time${sample ? ` (${sample.context}, L${sample.line})` : ''}: move the symbol into a file that does not import back, or defer the access`
+            : usage === 'deferred'
+              ? `only used inside functions/methods${sample ? ` (${sample.context}, L${sample.line})` : ''}: move that code, or invert the dependency (callback, injection token, event)`
+              : 'no runtime use besides loading the module: remove the import',
     });
   }
   return { sccId: scc.id, cuts, verified: stronglyConnectedComponents(sub).length === 0 };
+};
+
+const strongestSample = (e: GraphEdge): Usage | undefined => {
+  const rank = { type: 0, deferred: 1, eager: 2 };
+  let best: Usage | undefined;
+  for (const r of e.records) {
+    if (r.erased || r.kind === 'dynamic') continue;
+    for (const s of r.specifiers) for (const u of s.usages) if (!best || rank[u.timing] > rank[best.timing]) best = u;
+  }
+  return best;
 };
 
 const computeStats = (
@@ -506,6 +594,7 @@ const computeStats = (
     typeOnlyCycles: typeOnlySccs.length,
     diCycles: diCycles.length,
     entries: entries.length,
+    replayedOrders: 0,
     durationMs: Math.round(performance.now() - started),
     phases,
   };

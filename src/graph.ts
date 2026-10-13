@@ -3,8 +3,10 @@ import type {
   ExportRecord,
   GraphEdge,
   ImportRecord,
+  ImportSpecifierInfo,
   ModuleGraph,
   ModuleInfo,
+  Usage,
   UsageTiming,
 } from './types.js';
 
@@ -30,12 +32,16 @@ export const resolveExport = (
   modulePath: string,
   name: string,
   cache = new Map<string, ResolvedExport | null>(),
-  seen = new Set<string>(),
+  state: { seen: Set<string>; guarded: boolean } = { seen: new Set(), guarded: false },
 ): ResolvedExport | null => {
   const key = `${modulePath}\0${name}`;
   if (cache.has(key)) return cache.get(key)!;
-  if (seen.has(key)) return null;
-  seen.add(key);
+  if (state.seen.has(key)) {
+    // Cyclic `export *` chain: unresolved *on this path only* – must not be cached as a final null.
+    state.guarded = true;
+    return null;
+  }
+  state.seen.add(key);
 
   const mod = graph.modules.get(modulePath);
   let result: ResolvedExport | null = null;
@@ -49,18 +55,18 @@ export const resolveExport = (
       const re = direct.find((e) => e.kind === 'reexport');
       if (re) {
         if (re.from && re.importedName === '*') {
+          // `export * as ns from` – a module namespace object, available from link time on.
           result = { originPath: re.from, record: { ...re, kind: 'namespace' }, via: [modulePath] };
-        } else if (re.from && re.importedName) {
-          const inner = resolveExport(graph, re.from, re.importedName, cache, seen);
+        } else if (re.from && re.importedName && graph.modules.has(re.from)) {
+          const inner = resolveExport(graph, re.from, re.importedName, cache, state);
           if (inner) result = { ...inner, via: [modulePath, ...inner.via] };
-          else result = { originPath: re.from, record: { ...re, kind: 'unknown' }, via: [modulePath] };
-        } else {
-          result = { originPath: modulePath, record: { ...re, kind: 'unknown' }, via: [] };
         }
+        // Re-exports from packages / files outside the analysed set stay unresolved (null):
+        // their evaluation state is unknown, so they must never produce a finding.
       } else if (name !== 'default') {
         for (const star of mod.exportStar) {
-          if (!star) continue;
-          const inner = resolveExport(graph, star, name, cache, seen);
+          if (!star || !graph.modules.has(star)) continue;
+          const inner = resolveExport(graph, star, name, cache, state);
           if (inner) {
             result = { ...inner, via: [modulePath, ...inner.via] };
             break;
@@ -69,7 +75,8 @@ export const resolveExport = (
       }
     }
   }
-  cache.set(key, result);
+  state.seen.delete(key);
+  if (result !== null || !state.guarded) cache.set(key, result);
   return result;
 };
 
@@ -77,7 +84,65 @@ const isValueKind = (k: ExportKind): boolean =>
   k === 'class' || k === 'function' || k === 'const' || k === 'let' || k === 'var' || k === 'enum' || k === 'namespace' || k === 'unknown';
 
 /** Build the file-level dependency graph from parsed modules. */
-export const buildGraph = (root: string, modules: Map<string, ModuleInfo>): ModuleGraph => {
+/**
+ * Value-looking usages of bindings that do not exist at runtime are type usages after all:
+ * - interfaces/type aliases referenced by `emitDecoratorMetadata` or Angular factory parameters
+ *   (the compiler emits `Object` / nothing for them),
+ * - `const enum` members (inlined by the compiler; the import is elided),
+ * - namespace members that resolve to types.
+ * Returns true when any usage changed.
+ */
+const downgradeTypeBindings = (graph: ModuleGraph, record: ImportRecord, to: string, cache: Map<string, ResolvedExport | null>): boolean => {
+  if (record.kind !== 'static' && record.kind !== 'import-equals') return false;
+  let changed = false;
+  const typeLike = (k: ExportKind): boolean => k === 'type' || k === 'interface';
+  for (const spec of record.specifiers) {
+    if (spec.typeOnly || spec.effectiveTiming === 'unused' || spec.effectiveTiming === 'type') continue;
+    let specChanged = false;
+    if (spec.imported === '*') {
+      for (const u of spec.usages) {
+        if (u.timing === 'type' || u.member === undefined) continue;
+        const r = resolveExport(graph, to, u.member, cache);
+        if (r && typeLike(r.record.kind)) {
+          downgrade(u, r.record.kind);
+          specChanged = true;
+        }
+      }
+    } else {
+      const r = resolveExport(graph, to, spec.imported, cache);
+      for (const u of spec.usages) {
+        if (u.timing === 'type') continue;
+        const metadataOnly = u.contextKind === 'decorator-metadata' || u.contextKind === 'di-factory';
+        // Unresolvable metadata references are assumed erased (no class to emit); other unresolved usages stay.
+        if ((r && typeLike(r.record.kind)) || (!r && u.contextKind === 'decorator-metadata') || (r && metadataOnly && !isValueKind(r.record.kind))) {
+          downgrade(u, r?.record.kind ?? 'type');
+          specChanged = true;
+        }
+      }
+    }
+    if (specChanged) {
+      spec.effectiveTiming = spec.usages.reduce<UsageTiming | 'unused'>((acc, u) => (acc === 'unused' || RANK[u.timing] > RANK[acc] ? u.timing : acc), 'unused');
+      changed = true;
+    }
+  }
+  return changed;
+};
+
+const downgrade = (u: Usage, kind: ExportKind): void => {
+  u.context =
+    u.contextKind === 'decorator-metadata' || u.contextKind === 'di-factory'
+      ? `type position (${kind === 'interface' ? 'interface' : 'type'} – the compiler emits no value reference)`
+      : 'type position (const enum / type – inlined or erased by the compiler)';
+  u.timing = 'type';
+  u.contextKind = 'type';
+  delete u.call;
+};
+
+export interface BuildGraphOptions {
+  verbatimModuleSyntax?: boolean;
+}
+
+export const buildGraph = (root: string, modules: Map<string, ModuleInfo>, opts: BuildGraphOptions = {}): ModuleGraph => {
   const graph: ModuleGraph = {
     root,
     modules,
@@ -91,7 +156,7 @@ export const buildGraph = (root: string, modules: Map<string, ModuleInfo>): Modu
     graph.in.set(p, new Set());
   }
 
-  const exportCache = new Map();
+  const exportCache = new Map<string, ResolvedExport | null>();
 
   for (const mod of modules.values()) {
     for (const record of mod.imports) {
@@ -104,24 +169,20 @@ export const buildGraph = (root: string, modules: Map<string, ModuleInfo>): Modu
       const to = record.resolvedPath;
       if (to === mod.path) continue; // self import – ignore
 
-      // emitDecoratorMetadata usages of interfaces/types are not emitted -> downgrade to type.
-      for (const spec of record.specifiers) {
-        if (!spec.usages.some((u) => u.contextKind === 'decorator-metadata')) continue;
-        const resolved = spec.imported === '*' ? null : resolveExport(graph, to, spec.imported, exportCache);
-        const isValue = resolved ? isValueKind(resolved.record.kind) : false;
-        if (!isValue) {
-          for (const u of spec.usages) {
-            if (u.contextKind === 'decorator-metadata') {
-              u.timing = 'type';
-              u.contextKind = 'type';
-              u.context = 'type position (interface/type alias – no metadata emitted)';
-            }
-          }
-          spec.effectiveTiming = spec.usages.reduce<UsageTiming | 'unused'>((acc, u) => (acc === 'unused' || RANK[u.timing] > RANK[acc] ? u.timing : acc), 'unused');
-          if (record.kind === 'static' && !record.typeOnly && record.specifiers.every((s) => s.typeOnly || (!s.reexported && (s.effectiveTiming === 'type' || s.effectiveTiming === 'unused')))) {
-            record.erased = true;
-          }
-        }
+      const typeLike = (n: string): boolean => {
+        const r = resolveExport(graph, to, n, exportCache);
+        return r !== null && (r.record.kind === 'type' || r.record.kind === 'interface');
+      };
+      // `import { T } from './t'; export { T }` of a type: tsc elides both (isolatedModules forbids it).
+      if (!opts.verbatimModuleSyntax) for (const spec of record.specifiers) if (spec.reexported && spec.imported !== '*' && typeLike(spec.imported)) spec.reexported = false;
+      const changed = downgradeTypeBindings(graph, record, to, exportCache);
+      if (record.kind === 'static' && !record.typeOnly && (changed || record.specifiers.some((s) => s.reexported === false))) {
+        const erasable = (s: ImportSpecifierInfo): boolean => s.typeOnly || (!opts.verbatimModuleSyntax && !s.reexported && (s.effectiveTiming === 'type' || s.effectiveTiming === 'unused'));
+        if (record.specifiers.length > 0 && record.specifiers.every(erasable)) record.erased = true;
+      }
+      // `export { T } from './t'` where every name is a type: elided by tsc.
+      if (record.kind === 'reexport' && !record.erased && !opts.verbatimModuleSyntax && record.reexportedNames?.length && record.reexportedNames.every((n) => n.imported !== '*' && typeLike(n.imported))) {
+        record.erased = true;
       }
 
       const outMap = graph.out.get(mod.path)!;

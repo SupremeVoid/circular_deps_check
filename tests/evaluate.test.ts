@@ -22,7 +22,8 @@ describe('evaluation replay – binding states', () => {
       ['N', 'undefined', 'namespace'],
     ]);
     const finding = fromB.findings.find((f) => f.kind === 'runtime-break')!;
-    expect(finding.summary).toContain("'v' is undefined");
+    // `export const x = v` only captures the value: no throw, but a silently missing value
+    expect(finding.summary).toContain("'v' is still undefined here – no error at load time");
   });
 
   it('never fails on hoisted function declarations', async () => {
@@ -33,7 +34,7 @@ describe('evaluation replay – binding states', () => {
     });
     expect(r.entries[0]!.breakages.flatMap((b) => b.failing)).toHaveLength(0);
     expect(r.findings.map((f) => f.kind)).toEqual(['deferred-cycle']);
-    expect(r.findings[0]!.title).toContain('cannot break');
+    expect(r.findings[0]!.title).toContain('without load-time risk');
   });
 
   it('resolves re-exported bindings to their origin and checks that module state (barrel order matters)', async () => {

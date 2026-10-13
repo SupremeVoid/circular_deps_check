@@ -15,6 +15,8 @@ export type UsageContextKind =
   | 'extends'
   | 'decorator'
   | 'decorator-metadata'
+  /** Angular (ngtsc) constructor-parameter type: referenced as a value inside the generated `ɵfac` factory. */
+  | 'di-factory'
   | 'top-level'
   | 'top-level-call'
   | 'static-member'
@@ -41,6 +43,14 @@ export interface Usage {
   decorator?: string;
   /** Nearest enclosing object literal property name (e.g. `providers`, `imports`, `component`). */
   property?: string;
+  /** The binding is invoked here (`x()`, `new x()`, tagged template), not just read. */
+  call?: boolean;
+  /**
+   * Property read on the binding (`X.prop`, `X['prop']`); for a call this is the invoked static
+   * method. `'*'` means every member is read (`Object.keys(ns)`, `{ ...ns }`, `const { a, b } = ns`
+   * records the individual members instead).
+   */
+  access?: string;
 }
 
 export interface ImportSpecifierInfo {
@@ -110,6 +120,8 @@ export interface ExportRecord {
   /** Function declarations are hoisted and initialised before any module body runs. */
   hoisted: boolean;
   line: number;
+  /** Name of the top-level declaration in this module that backs the export (absent for re-exports / `export default expr`). */
+  localName?: string;
   /** For re-exports: resolved path of the source module (null if unresolved). */
   from?: string | null;
   /** For re-exports: name in the source module. */
@@ -119,6 +131,23 @@ export interface ExportRecord {
    * Used to verify "move symbol to its own file" suggestions.
    */
   usesImports: string[];
+}
+
+/** Top-level declaration of a module (exported or not). */
+export interface TopLevelDecl {
+  kind: ExportKind;
+  line: number;
+}
+
+/**
+ * What a top-level function (or class constructor) touches when it is called: module-level
+ * bindings of its own file and imported bindings, referenced directly in its body (nested
+ * callbacks that are not invoked immediately are excluded to avoid false positives).
+ */
+export interface Footprint {
+  line: number;
+  imports: { local: string; member?: string; line: number; call: boolean }[];
+  locals: { name: string; member?: string; line: number; call: boolean }[];
 }
 
 export interface DiDependencyFlags {
@@ -133,7 +162,7 @@ export interface DiDependency {
   token: string;
   line: number;
   column: number;
-  via: 'constructor-param' | 'inject-field' | 'inject-constructor';
+  via: 'constructor-param' | 'inject-field' | 'inject-constructor' | 'provider' | 'token-factory';
   flags: DiDependencyFlags;
 }
 
@@ -142,20 +171,29 @@ export interface ProviderInfo {
   line: number;
   useClass?: string;
   useExisting?: string;
-  deps?: string[];
+  /** `deps: [...]` entries and tokens passed to `inject()` inside `useFactory`. */
+  deps?: { token: string; flags: DiDependencyFlags }[];
 }
 
-export type AngularDecoratorName = 'Injectable' | 'Component' | 'Directive' | 'Pipe' | 'NgModule';
+export type AngularDecoratorName = 'Injectable' | 'Component' | 'Directive' | 'Pipe' | 'NgModule' | 'InjectionToken';
 
 export interface AngularClassInfo {
   name: string;
   line: number;
-  decorator: AngularDecoratorName;
+  /** `none`: undecorated class that injects something – only relevant as a base class. */
+  decorator: AngularDecoratorName | 'none';
   providedIn?: string;
+  /** Own dependencies: constructor parameters, `inject()` in field initializers / constructor / parameter defaults. */
   deps: DiDependency[];
+  /** `providers` / `viewProviders` of a component, directive or NgModule (scoped to that injector). */
   providers: ProviderInfo[];
+  /** `@Injectable({ useClass | useExisting | useFactory })`: how the class's own token is created. */
+  selfProvider?: ProviderInfo;
   /** Names listed in the `imports` array of a standalone component/NgModule. */
   imports: string[];
+  /** Base class expression (`extends X`) – Angular inherits its factory and field injections. */
+  extends?: string;
+  hasConstructor: boolean;
 }
 
 export interface ModuleInfo {
@@ -173,6 +211,14 @@ export interface ModuleInfo {
   loc: number;
   /** Top-level declaration names (exported or not), used to resolve DI tokens declared in the same file. */
   localClasses: string[];
+  /** Top-level declarations by name with their kind and line (for initialisation-state checks). */
+  topLevel: Record<string, TopLevelDecl>;
+  /** Footprints of top-level functions, arrow-function constants and classes (by local name). */
+  footprints: Record<string, Footprint>;
+  /** Value dependencies of each top-level declaration: imports and other top-level declarations it references. */
+  declDeps: Record<string, { imports: string[]; locals: string[] }>;
+  /** Providers declared outside decorators (`app.config.ts`, `bootstrapApplication`, routes) – root scope. */
+  rootProviders: ProviderInfo[];
   parseErrors: string[];
 }
 
@@ -222,9 +268,25 @@ export interface Scc {
 
 export type BindingState = 'initialised' | 'tdz' | 'undefined' | 'hoisted';
 
+/** One hop of a load-time call chain into another module's function. */
+export interface CallStep {
+  /** Function (or class) being called. */
+  fn: string;
+  /** Module declaring it. */
+  path: string;
+  /** Line inside that function where the next hop / the failing read happens. */
+  line: number;
+}
+
+export type EntryKind = 'main' | 'test' | 'lazy' | 'hypothetical';
+
 export interface FailingUsage {
   specifier: ImportSpecifierInfo;
   usage: Usage;
+  /** Name of the binding that is not initialised (differs from the import when reached through a call chain). */
+  binding: string;
+  /** Call chain from the usage into the function(s) that read the uninitialised binding. */
+  via?: CallStep[];
   /** Module where the binding is declared (after following re-exports). */
   originPath: string | null;
   originKind: ExportKind;
@@ -247,7 +309,7 @@ export interface EdgeBreakage {
 
 export interface EntryEvaluation {
   entry: string;
-  kind: 'main' | 'test' | 'lazy';
+  kind: EntryKind;
   breakages: EdgeBreakage[];
   evaluatedCount: number;
 }
@@ -257,7 +319,9 @@ export interface DiNode {
   name: string;
   path: string | null;
   line: number;
-  decorator: AngularDecoratorName | 'token' | 'external';
+  decorator: AngularDecoratorName | 'none' | 'token' | 'external';
+  /** Injector the node lives in: `root`, or the component/directive whose `providers` declare it. */
+  scope?: string;
 }
 
 export interface DiEdge {
@@ -277,10 +341,14 @@ export interface DiCycle {
 export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 
 export type FindingKind =
+  /** Crashes when loaded from the app entry or a lazy chunk. */
   | 'runtime-break'
+  /** Crashes only when a spec file is the entry. */
   | 'test-break'
   | 'di-cycle'
+  /** Crashes if a file of the cyclic group is imported first (proven by replaying that order). */
   | 'latent-cycle'
+  /** Runtime import cycle that cannot crash under any load order (one finding per cyclic group). */
   | 'deferred-cycle'
   | 'type-only-cycle';
 
@@ -307,12 +375,16 @@ export interface FailurePoint {
   from: string;
   to: string;
   usage: Usage;
+  /** The imported symbol used at `usage`. */
   symbol: string;
+  /** The binding that is not initialised (equals `symbol` unless reached through a call chain). */
+  binding: string;
+  via?: CallStep[];
   originPath: string | null;
   originKind: ExportKind;
   state: BindingState;
   /** Entries under which this failure is triggered. */
-  entries: { entry: string; kind: 'main' | 'test' | 'lazy'; chain: string[] }[];
+  entries: { entry: string; kind: EntryKind; chain: string[] }[];
 }
 
 export interface Finding {
@@ -355,6 +427,8 @@ export interface AnalysisStats {
   typeOnlyCycles: number;
   diCycles: number;
   entries: number;
+  /** Hypothetical load orders replayed (one per file of each cyclic group). */
+  replayedOrders: number;
   durationMs: number;
   phases: Record<string, number>;
 }
@@ -376,8 +450,18 @@ export interface AnalysisResult {
 
 export interface FixPlan {
   sccId: number;
-  /** Ordered edges whose removal makes the SCC acyclic (greedy). */
-  cuts: { from: string; to: string; symbols: string[]; usage: UsageTiming | 'none'; reason: string }[];
+  /** Ordered edges whose removal (or barrel rewiring) makes the SCC acyclic (greedy). */
+  cuts: {
+    from: string;
+    to: string;
+    symbols: string[];
+    usage: UsageTiming | 'none';
+    /** rewire-barrel: import from the declaring files; drop-reexport: barrel re-export; move-code / remove-import: break the dependency. */
+    action: 'rewire-barrel' | 'drop-reexport' | 'move-code' | 'remove-import';
+    /** For rewire-barrel: the declaring files the import is redirected to. */
+    rewiredTo?: string[];
+    reason: string;
+  }[];
   verified: boolean;
 }
 

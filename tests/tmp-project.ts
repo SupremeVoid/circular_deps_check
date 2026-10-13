@@ -12,10 +12,12 @@ const TSCONFIG = JSON.stringify({
 /** Create a throw-away project from a `relative path -> source` map and analyze it. */
 export const analyzeProject = async (
   files: Record<string, string>,
-  opts: { entries?: string[]; testEntries?: string[]; noTestEntries?: boolean; emitDecoratorMetadata?: boolean; angular?: boolean } = {},
+  opts: { entries?: string[]; testEntries?: string[]; noTestEntries?: boolean; emitDecoratorMetadata?: boolean; angular?: boolean; compilerOptions?: Record<string, unknown> } = {},
 ): Promise<AnalysisResult & { dir: string; file: (rel: string) => string }> => {
   const dir = normalizePath(fs.mkdtempSync(path.join(os.tmpdir(), 'circdeps-proj-')));
-  fs.writeFileSync(path.join(dir, 'tsconfig.json'), TSCONFIG);
+  const tsconfig = JSON.parse(TSCONFIG) as { compilerOptions: Record<string, unknown> };
+  Object.assign(tsconfig.compilerOptions, opts.compilerOptions ?? {});
+  fs.writeFileSync(path.join(dir, 'tsconfig.json'), JSON.stringify(tsconfig));
   for (const [rel, src] of Object.entries(files)) {
     const p = path.join(dir, rel);
     fs.mkdirSync(path.dirname(p), { recursive: true });

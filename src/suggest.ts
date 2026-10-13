@@ -6,6 +6,7 @@ import type { Cycle, FailurePoint, GraphEdge, ModuleGraph, Suggestion, Usage } f
 import { resolveExport, type ResolvedExport } from './graph.js';
 import { reaches, type Adjacency } from './cycles.js';
 import { relativeTo } from './util/paths.js';
+import path from 'node:path';
 
 export interface SuggestContext {
   graph: ModuleGraph;
@@ -15,6 +16,30 @@ export interface SuggestContext {
 }
 
 const rel = (ctx: SuggestContext, p: string): string => relativeTo(ctx.graph.root, p);
+
+/** Module specifier to write in `fromFile` for `target`: relative, without the `.ts` extension. */
+export const importSpecifier = (fromFile: string, target: string): string => {
+  let r = path.posix.relative(path.posix.dirname(fromFile), target).replace(/\.(d\.)?(ts|tsx|mts|cts)$/, '');
+  if (!r.startsWith('.')) r = `./${r}`;
+  return r;
+};
+
+/** Value imports carried by an edge that are not in `moved` (they keep the import alive). */
+const remainingImports = (edge: GraphEdge, moved: Set<string>): string[] => {
+  const out: string[] = [];
+  for (const r of edge.records) {
+    if (r.erased || r.kind === 'dynamic') continue;
+    if (r.kind === 'side-effect') out.push('(side-effect import)');
+    if (r.kind === 'reexport' || r.kind === 'reexport-all') out.push('re-exports');
+    for (const sp of r.specifiers) {
+      if (sp.effectiveTiming === 'unused' || sp.effectiveTiming === 'type') continue;
+      if (sp.imported === '*') {
+        for (const m of new Set(sp.usages.map((u) => u.member).filter((x): x is string => Boolean(x)))) if (!moved.has(m)) out.push(`${sp.local}.${m}`);
+      } else if (!moved.has(sp.imported)) out.push(sp.imported);
+    }
+  }
+  return [...new Set(out)];
+};
 
 const strongestUsage = (edge: GraphEdge): { symbol: string; usage: Usage } | null => {
   let best: { symbol: string; usage: Usage } | null = null;
@@ -76,7 +101,7 @@ export const directImportSuggestion = (ctx: SuggestContext, edge: GraphEdge): Su
   for (const origin of origins.keys()) {
     if (origin === edge.from || reaches(ctx.adj, origin, edge.from)) blockers.push(origin);
   }
-  const lines = [...origins.entries()].map(([origin, syms]) => `import { ${syms.join(', ')} } from '${rel(ctx, origin)}'`);
+  const lines = [...origins.entries()].map(([origin, syms]) => `import { ${syms.join(', ')} } from '${importSpecifier(edge.from, origin)}';`);
   if (blockers.length === 0 && unresolved === 0) {
     return {
       kind: 'direct-import',
@@ -114,8 +139,19 @@ export const moveSymbolSuggestion = (ctx: SuggestContext, edge: GraphEdge, onlyS
       continue;
     }
     names.push(s.symbol);
+    // What the declaration needs, following local helpers it references (they would move along).
+    const imports = new Set<string>(s.origin.record.usesImports);
+    const localName = s.origin.record.localName ?? s.symbol;
+    const queue = [localName];
+    const seenLocals = new Set(queue);
+    while (queue.length > 0) {
+      const d = originMod.declDeps[queue.pop()!];
+      if (!d) continue;
+      for (const i of d.imports) imports.add(i);
+      for (const l of d.locals) if (!seenLocals.has(l)) { seenLocals.add(l); queue.push(l); }
+    }
     const deps = new Set<string>();
-    for (const local of s.origin.record.usesImports) {
+    for (const local of imports) {
       for (const r of originMod.imports) {
         if (r.erased || r.kind === 'dynamic' || !r.resolvedPath || r.external) continue;
         if (r.specifiers.some((sp) => sp.local === local)) deps.add(r.resolvedPath);
@@ -131,11 +167,16 @@ export const moveSymbolSuggestion = (ctx: SuggestContext, edge: GraphEdge, onlyS
   }
   if (names.length === 0) return null;
   const list = names.map((n) => `\`${n}\``).join(', ');
+  const remaining = remainingImports(edge, new Set(names));
+  const cycleStays = remaining.length > 0 && reaches(ctx.adj, edge.to, edge.from);
+  if (allVerified && cycleStays) {
+    details.push(`\`${rel(ctx, edge.from)}\` still imports ${remaining.map((r) => `\`${r}\``).join(', ')} from \`${rel(ctx, edge.to)}\`, so the import cycle itself remains (without this crash).`);
+  }
   return {
     kind: 'move-symbol',
     text: allVerified
-      ? `Move ${list} out of \`${rel(ctx, edge.to)}\` into a separate file and import it from there – verified to remove this cycle.`
-      : `Moving ${list} out of \`${rel(ctx, edge.to)}\` alone does not remove the cycle (see details).`,
+      ? `Move ${list} out of \`${rel(ctx, edge.to)}\` into a separate file and import it from there – verified to fix this crash${cycleStays ? '' : ' and remove this cycle'}.`
+      : `Moving ${list} out of \`${rel(ctx, edge.to)}\` alone does not help (see details).`,
     verified: allVerified,
     details,
   };
@@ -149,10 +190,15 @@ const lazyRouteSuggestion = (ctx: SuggestContext, edge: GraphEdge): Suggestion |
       const u = s.usages.find((x) => x.timing === 'eager' && x.contextKind === 'top-level' && x.property === 'component');
       if (!u) continue;
       const symbol = s.imported === '*' ? `${s.local}.${u.member ?? ''}` : s.imported;
+      const remaining = remainingImports(edge, new Set([s.imported === '*' ? (u.member ?? '') : s.imported]));
+      const lazy = `\`loadComponent: () => import('${r.specifierText}').then(m => m.${symbol})\``;
       return {
         kind: 'lazy-route',
-        text: `The route in \`${rel(ctx, edge.from)}\`:${u.line} references \`${symbol}\` eagerly. Use \`loadComponent: () => import('${r.specifierText}').then(m => m.${symbol})\` – the static import disappears and with it this cycle.`,
-        verified: true,
+        text:
+          remaining.length === 0
+            ? `The route in \`${rel(ctx, edge.from)}\`:${u.line} references \`${symbol}\` eagerly. Use ${lazy} – the static import disappears and with it this cycle.`
+            : `The route in \`${rel(ctx, edge.from)}\`:${u.line} references \`${symbol}\` eagerly. ${lazy} removes this read, but ${remaining.map((x) => `\`${x}\``).join(', ')} still keep${remaining.length === 1 ? 's' : ''} the static import – move ${remaining.length === 1 ? 'it' : 'them'} too to remove the cycle.`,
+        verified: remaining.length === 0,
       };
     }
   }
@@ -183,7 +229,7 @@ const angularSuggestion = (ctx: SuggestContext, edge: GraphEdge, failure: Failur
   if (u.contextKind === 'decorator-metadata') {
     return {
       kind: 'decorator-metadata',
-      text: `The only eager reference comes from \`emitDecoratorMetadata\` (constructor parameter type in \`${from}\`). Angular's AOT compiler does not need it: set \`"emitDecoratorMetadata": false\` in tsconfig, or annotate the parameter with \`@Inject(forwardRef(() => ${best.symbol}))\`.`,
+      text: `The eager reference comes from \`emitDecoratorMetadata\`: TypeScript emits the parameter/property type \`${best.symbol}\` as a value when the class definition in \`${from}\` runs. Set \`"emitDecoratorMetadata": false\` if no library needs runtime type metadata, or type that parameter with an interface (or \`import type\`) – the metadata then records \`Object\` instead. (\`@Inject(forwardRef(...))\` does not help: the type is still emitted.)`,
       verified: true,
     };
   }
