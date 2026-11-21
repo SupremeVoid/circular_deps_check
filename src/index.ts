@@ -1,4 +1,5 @@
-export { analyze, countBySeverity, severityRank } from './analyze.js';
+export { analyze, countBySeverity, severityRank, simulateChanges, type ImportChange, type Simulation } from './analyze.js';
+export * from './query.js';
 export type { AnalyzeProgress } from './analyze.js';
 export { resolveConfig, type CircdepsOptions, type ResolvedConfig } from './config.js';
 export { renderTextReport, type TextReportOptions } from './report/text.js';

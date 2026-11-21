@@ -9,6 +9,7 @@ import { toJsonReport } from './report/json.js';
 import { c, setColor } from './util/ansi.js';
 import type { Severity } from './types.js';
 import { severityRank } from './analyze.js';
+import { QUERY_COMMANDS, QUERY_HELP, runQueryCommand, type QueryCommand } from './cli-query.js';
 
 const readVersion = (): string => {
   try {
@@ -57,9 +58,21 @@ Options:
   -v, --version            show version
 
 Config file: circdeps.config.json in the project root (same keys as the JS API options).
+
+${QUERY_HELP}
+For AI agents: \`circdeps mcp [--root <dir>]\` starts a Model Context Protocol server (stdio) with the
+same questions as tools (analyze, list_findings, get_finding, get_fix_plan, simulate_changes, recheck).
 `;
 
 export const runCli = async (argv: string[]): Promise<number> => {
+  // Subcommands: focused questions (query layer) and the MCP server for agents.
+  const sub = argv[0];
+  if (sub && (QUERY_COMMANDS as readonly string[]).includes(sub)) return runQueryCommand(sub as QueryCommand, argv.slice(1));
+  if (sub === 'mcp') {
+    // loaded on demand: the normal CLI does not need the protocol library
+    const { runMcpServer } = await import('./mcp.js');
+    return runMcpServer(argv.slice(1), readVersion());
+  }
   let parsed: ReturnType<typeof parseArgs<typeof spec>>;
   const spec = {
     options: {

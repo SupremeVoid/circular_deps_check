@@ -145,7 +145,7 @@ export const analyze = async (opts: CircdepsOptions = {}, progress?: AnalyzeProg
   for (const f of findings) if (f.kind === 'runtime-break' || f.kind === 'test-break' || f.kind === 'possible-break') for (const fp of f.failures) failingEdges.add(edgeKey(fp.from, fp.to));
   const fixPlans = time('fix-plans', () => sccs.map((s) => planFixes(graph, runtimeAdj, s, suggestCtx.exportCache, failingEdges)));
   // Replay the real entry points with each plan applied step by step: what is left, what surfaces next.
-  if (config.fixPreview) time('fix-preview', () => previewFixes(graph, fixPlans, findings, sccByNode, mainEntries, testEntries, entries));
+  if (config.fixPreview) time('fix-preview', () => previewFixes(createReplay(graph, findings, sccs, mainEntries, testEntries, entries), fixPlans));
 
   const stats = computeStats(graph, sccs, typeOnlySccs, diCycles, entries, findings, started, phases);
   stats.replayedOrders = replays.length;
@@ -170,6 +170,7 @@ export const analyze = async (opts: CircdepsOptions = {}, progress?: AnalyzeProg
     diCycles,
     graph,
     fixPlans,
+    entryFiles: { main: mainEntries, test: testEntries },
   };
 };
 
@@ -321,7 +322,7 @@ const composeFindings = (
         }
         let fp = perEdge.get(key);
         if (!fp) {
-          fp = { from: b.from, to: b.to, usage: f.usage, symbol, binding: f.binding, via: f.via, uncertain: f.uncertain, originPath: f.originPath, originKind: f.originKind, state: f.state, entries: [] };
+          fp = { from: b.from, to: b.to, usage: f.usage, symbol, binding: f.binding, via: f.via, uncertain: f.uncertain, originPath: f.originPath, originKind: f.originKind, state: f.state, key: '', entries: [] };
           perEdge.set(key, fp);
         }
         if (f.originState === 'in-progress') inProgress.set(fp, true);
@@ -377,6 +378,7 @@ const composeFindings = (
             : 'Crashes when loaded from tests';
     findings.push({
       id: '',
+      key: '',
       severity,
       kind,
       title: `${prefix}: ${titleWhat} in \`${rel(from)}\``,
@@ -431,6 +433,7 @@ const composeFindings = (
     const example = `\`${rel(first.from)}:${first.usage.line}\` ${whatOf(first)} too early if \`${rel(first.entries[0]!.entry)}\` is the first file of the group to be imported`;
     findings.push({
       id: '',
+      key: '',
       severity: 'low',
       kind: 'latent-cycle',
       title: `Order-dependent: ${reads} in group #${sccId} ${n === 1 ? 'relies' : 'rely'} on today's import order`,
@@ -450,6 +453,7 @@ const composeFindings = (
     const firstPath = dc.nodes[0]?.path;
     findings.push({
       id: '',
+      key: '',
       severity: dc.certain ? 'high' : 'medium',
       kind: 'di-cycle',
       title: `Angular DI cycle (NG0200): ${names.join(' → ')} → ${names[0]}`,
@@ -480,6 +484,7 @@ const composeFindings = (
         : 'The files only reach each other through barrel re-exports or side-effect imports.';
     findings.push({
       id: '',
+      key: '',
       severity: 'info',
       kind: 'deferred-cycle',
       title: `Import cycle without load-time risk: ${scc.nodes.length} files (group #${scc.id})`,
@@ -500,6 +505,7 @@ const composeFindings = (
       const allErased = cycle ? erasedEdges.length === cycle.edges.length : true;
       findings.push({
         id: '',
+        key: '',
         severity: 'info',
         kind: 'type-only-cycle',
         title: allErased
@@ -536,6 +542,7 @@ const composeFindings = (
     return a.title.localeCompare(b.title);
   });
   findings.forEach((f, i) => (f.id = `C${i + 1}`));
+  assignKeys(findings, sccs, typeOnlySccs, rel);
   return findings;
 };
 
@@ -560,31 +567,64 @@ const groupGateways = (realEntries: EntryEvaluation[]): Map<number, GroupGateway
 };
 
 /**
- * Fix previews may replay at most this many times the number of real entry points (one replay of
- * one entry per cut), so they cost a bounded multiple of the normal evaluation on huge projects.
+ * Keys that identify a finding or a failing read across runs (ids are positions in a sorted list
+ * and shift): no line numbers, so an edit elsewhere in a file does not change them.
+ */
+const assignKeys = (findings: Finding[], sccs: Scc[], typeOnlySccs: Scc[], rel: (p: string) => string): void => {
+  const firstFile = new Map<number, string>();
+  for (const s of [...sccs, ...typeOnlySccs]) firstFile.set(s.id, [...s.nodes].map(rel).sort()[0] ?? '');
+  for (const f of findings) {
+    const first = f.failures[0];
+    f.key =
+      f.kind === 'di-cycle'
+        ? `di:${(f.diCycle?.nodes ?? []).map((n) => n.name).sort().join('+')}`
+        : f.kind === 'latent-cycle'
+          ? `order:${firstFile.get(f.sccId) ?? (first ? rel(first.from) : '')}`
+          : f.kind === 'deferred-cycle'
+            ? `cycle:${firstFile.get(f.sccId) ?? ''}`
+            : f.kind === 'type-only-cycle'
+              ? `types:${firstFile.get(f.sccId) ?? ''}`
+              : `${f.kind === 'possible-break' ? 'possible' : 'read'}:${first ? `${rel(first.from)}>${rel(first.to)}` : ''}`;
+  }
+  const seen = new Map<string, number>();
+  const all = findings.flatMap((f) => f.failures).sort((x, y) => x.from.localeCompare(y.from) || x.usage.line - y.usage.line || x.usage.column - y.usage.column);
+  for (const fp of all) {
+    const base = `${rel(fp.from)}|${fp.symbol}|${fp.binding}|${fp.originPath ? rel(fp.originPath) : ''}`;
+    const n = seen.get(base) ?? 0;
+    seen.set(base, n + 1);
+    fp.key = n === 0 ? base : `${base}#${n + 1}`;
+  }
+};
+
+/**
+ * Replays may cover at most this many times the number of real entry points per run (one replay of
+ * one entry per step), so they cost a bounded multiple of the normal evaluation on huge projects.
  */
 const PREVIEW_BUDGET_FACTOR = 4;
 const PREVIEW_BUDGET_MIN = 2000;
 
 const pointKey = (fp: FailurePoint): string => `${fp.from}\0${fp.usage.line}:${fp.usage.column}\0${fp.binding}\0${(fp.via ?? []).map((s) => `${s.path}#${s.fn}`).join('>')}`;
 
+/** What a replay with changed imports shows, compared with today. */
+export interface ReplayDiff {
+  /** Crash findings of today that no longer occur. */
+  resolved: string[];
+  /** Reads that failed before and still fail (within the given groups when there are any). */
+  remaining: PreviewFailure[];
+  /** Reads that did not fail before and fail now. */
+  exposed: PreviewFailure[];
+}
+
 /**
- * "What happens after I fix this?" – replay the real entry points with each plan applied one cut
- * at a time. Changing an import changes the load order, so a read that is safe today can become
- * the next crash; the preview names it before the developer finds out the hard way.
+ * "What happens if these imports change?" – shared by the fix previews and by `simulateChanges`.
+ * Replays the real entry points on a modified import graph and compares the failing reads with
+ * the unmodified run. A read is tracked per kind of entry: failing only in specs and failing on
+ * app load are two things, and a change can turn the first into the second.
  */
-const previewFixes = (
-  graph: ModuleGraph,
-  plans: FixPlan[],
-  findings: Finding[],
-  sccByNode: Map<string, Scc>,
-  mainEntries: string[],
-  testEntries: string[],
-  baseline: EntryEvaluation[],
-): void => {
-  // A read is tracked per kind of entry: failing only in specs and failing on app load are two things,
-  // and a fix can turn the first into the second.
+const createReplay = (graph: ModuleGraph, findings: Finding[], sccs: Scc[], mainEntries: string[], testEntries: string[], baseline: EntryEvaluation[]) => {
   type Hit = { point: string; from: string; f: FailingUsage; entry: string; kind: EntryKind };
+  const groupOf = new Map<string, number>();
+  for (const s of sccs) for (const n of s.nodes) groupOf.set(n, s.id);
   const side = (kind: EntryKind): 'app' | 'test' => (kind === 'test' ? 'test' : 'app');
   const collect = (evs: EntryEvaluation[]): Map<string, Hit> => {
     const out = new Map<string, Hit>();
@@ -600,12 +640,6 @@ const previewFixes = (
     }
     return out;
   };
-  /** One line per read, the app-load variant first. */
-  const list = (hits: Hit[]): PreviewFailure[] => {
-    const byPoint = new Map<string, Hit>();
-    for (const h of hits) if (!byPoint.has(h.point) || side(h.kind) === 'app') byPoint.set(h.point, h);
-    return [...byPoint.values()].map(describe);
-  };
   const findingOf = new Map<string, Finding>();
   for (const f of findings) for (const fp of f.failures) if (!findingOf.has(pointKey(fp)) || f.kind !== 'latent-cycle') findingOf.set(pointKey(fp), f);
   const describe = (hit: Hit): PreviewFailure => ({
@@ -614,55 +648,91 @@ const previewFixes = (
     column: hit.f.usage.column,
     symbol: symbolOf(hit.f),
     binding: hit.f.binding,
-    sccId: sccByNode.get(hit.from)?.id ?? 0,
+    sccId: groupOf.get(hit.from) ?? 0,
     entry: hit.entry,
     entryKind: hit.kind,
     uncertain: hit.f.uncertain,
     knownAs: findingOf.get(hit.point)?.id,
     knownKind: findingOf.get(hit.point)?.kind,
   });
+  /** One line per read, the app-load variant first. */
+  const list = (hits: Hit[]): PreviewFailure[] => {
+    const byPoint = new Map<string, Hit>();
+    for (const h of hits) if (!byPoint.has(h.point) || side(h.kind) === 'app') byPoint.set(h.point, h);
+    return [...byPoint.values()].map(describe);
+  };
   const crashKinds = new Set<FindingKind>(['runtime-break', 'test-break', 'possible-break']);
-  const worstOf = (sccId: number): number => findings.filter((f) => f.sccId === sccId && f.failures.length > 0).reduce((w, f) => Math.min(w, SEVERITY_RANK[f.severity]), 99);
-
   let budget = Math.max(PREVIEW_BUDGET_MIN, PREVIEW_BUDGET_FACTOR * (mainEntries.length + testEntries.length));
-  const ordered = plans.filter((p) => p.cuts.length > 0 && worstOf(p.sccId) < 99).sort((a, b) => worstOf(a.sccId) - worstOf(b.sccId) || a.sccId - b.sccId);
+
+  return {
+    mainEntries,
+    worstOf: (sccId: number): number => findings.filter((f) => f.sccId === sccId && f.failures.length > 0).reduce((w, f) => Math.min(w, SEVERITY_RANK[f.severity]), 99),
+    /**
+     * The entry points to replay for changes in `changedFiles`: the app entries plus the specs that
+     * load one of those files (runtime imports only). Falls back to the app entries when the specs
+     * would exceed the budget for `replays` replays; null when not even that fits.
+     */
+    scope(changedFiles: string[], replays: number): { tests: string[]; skippedTests: number } | null {
+      const affected = new Set<string>(changedFiles);
+      const stack = [...affected];
+      while (stack.length > 0) {
+        const node = stack.pop()!;
+        for (const importer of graph.in.get(node) ?? []) {
+          if (affected.has(importer) || !graph.out.get(importer)?.get(node)?.runtime) continue;
+          affected.add(importer);
+          stack.push(importer);
+        }
+      }
+      let tests = testEntries.filter((t) => affected.has(t));
+      let skippedTests = 0;
+      if (replays * (mainEntries.length + tests.length) > budget) {
+        skippedTests = tests.length;
+        tests = [];
+      }
+      if (replays * mainEntries.length > budget) return null;
+      budget -= replays * (mainEntries.length + tests.length);
+      return { tests, skippedTests };
+    },
+    /** Compare one or more replays (alternative ways to make the same change) with today. */
+    diff(tests: string[], overrides: EvalOverrides[], groupIds?: Set<number>): ReplayDiff {
+      const roots = new Set([...mainEntries, ...tests]);
+      const before = collect(baseline.filter((ev) => roots.has(ev.root)));
+      const failing = new Map<string, Hit>();
+      for (const o of overrides) for (const [key, hit] of collect(evaluateAll(graph, mainEntries, tests, { overrides: o }))) if (!failing.has(key)) failing.set(key, hit);
+      const failsIn = (hits: Map<string, Hit>, fp: FailurePoint): boolean => hits.has(`app\0${pointKey(fp)}`) || hits.has(`test\0${pointKey(fp)}`);
+      // A finding counts as resolved only if every entry it fails under was replayed and is clean now.
+      const allReplayed = (fp: FailurePoint): boolean => fp.entries.every((e) => (e.kind === 'test' ? roots.has(e.entry) : e.kind !== 'hypothetical'));
+      const crashFindings = findings.filter((f) => crashKinds.has(f.kind) && f.failures.some((fp) => failsIn(before, fp)));
+      return {
+        resolved: crashFindings.filter((f) => f.failures.every((fp) => !failsIn(failing, fp) && allReplayed(fp))).map((f) => f.id),
+        remaining: list([...failing].filter(([key, hit]) => before.has(key) && (groupIds === undefined || groupIds.has(groupOf.get(hit.from) ?? 0))).map(([, hit]) => hit)),
+        exposed: list([...failing].filter(([key]) => !before.has(key)).map(([, hit]) => hit)),
+      };
+    },
+  };
+};
+
+type Replay = ReturnType<typeof createReplay>;
+
+/**
+ * "What happens after I fix this?" – replay the real entry points with each plan applied one cut
+ * at a time. Changing an import changes the load order, so a read that is safe today can become
+ * the next crash; the preview names it before the developer finds out the hard way.
+ */
+const previewFixes = (replay: Replay, plans: FixPlan[]): void => {
+  const ordered = plans.filter((p) => p.cuts.length > 0 && replay.worstOf(p.sccId) < 99).sort((a, b) => replay.worstOf(a.sccId) - replay.worstOf(b.sccId) || a.sccId - b.sccId);
   for (const plan of ordered) {
     if (plan.cuts.some((c) => c.action === 'drop-reexport')) {
       plan.preview = { simulated: false, reason: 'the plan changes a barrel re-export, so the result depends on how the importers of that barrel are rewritten', steps: [], entries: 0 };
       continue;
     }
-    // Only entries that load a changed file load differently (runtime imports only).
-    const affected = new Set<string>(plan.cuts.map((c) => c.from));
-    const stack = [...affected];
-    while (stack.length > 0) {
-      const node = stack.pop()!;
-      for (const importer of graph.in.get(node) ?? []) {
-        if (affected.has(importer) || !graph.out.get(importer)?.get(node)?.runtime) continue;
-        affected.add(importer);
-        stack.push(importer);
-      }
-    }
-    let tests = testEntries.filter((t) => affected.has(t));
-    let skippedTests = 0;
     // A cut whose symbol could move along with imports of its own is replayed both ways (see below).
-    const replays = plan.cuts.length * (plan.cuts.some((c) => c.loadsInstead) ? 2 : 1);
-    if (replays * (mainEntries.length + tests.length) > budget) {
-      // Too many specs load this group to replay them for every step: fall back to the app entries.
-      skippedTests = tests.length;
-      tests = [];
-    }
-    if (replays * mainEntries.length > budget || mainEntries.length + tests.length === 0) {
-      plan.preview = { simulated: false, reason: mainEntries.length + tests.length === 0 ? 'no entry point loads these files' : 'the replay budget of this run is used up by more severe groups', steps: [], entries: 0 };
+    const scope = replay.scope(plan.cuts.map((c) => c.from), plan.cuts.length * (plan.cuts.some((c) => c.loadsInstead) ? 2 : 1));
+    if (!scope || replay.mainEntries.length + scope.tests.length === 0) {
+      plan.preview = { simulated: false, reason: scope ? 'no entry point loads these files' : 'the replay budget of this run is used up by more severe groups', steps: [], entries: 0 };
       continue;
     }
-    budget -= replays * (mainEntries.length + tests.length);
-    const roots = new Set([...mainEntries, ...tests]);
-    const before = collect(baseline.filter((ev) => roots.has(ev.root)));
-    const failsIn = (hits: Map<string, Hit>, fp: FailurePoint): boolean => hits.has(`app\0${pointKey(fp)}`) || hits.has(`test\0${pointKey(fp)}`);
-    // A finding counts as resolved only if every entry it fails under was replayed and is clean now.
-    const allReplayed = (fp: FailurePoint): boolean => fp.entries.every((e) => (e.kind === 'test' ? roots.has(e.entry) : e.kind !== 'hypothetical'));
-    const crashFindings = findings.filter((f) => crashKinds.has(f.kind) && f.failures.some((fp) => failsIn(before, fp)));
-    const overrides: Required<EvalOverrides> = { removed: new Set(), rewired: new Map(), added: new Map() };
+    const overrides: Required<Omit<EvalOverrides, 'deferred'>> = { removed: new Set(), rewired: new Map(), added: new Map() };
     const steps: NonNullable<FixPlan['preview']>['steps'] = [];
     for (const c of plan.cuts) {
       if (c.action === 'rewire-barrel') overrides.rewired.set(edgeKey(c.from, c.to), c.rewiredTo ?? []);
@@ -672,18 +742,98 @@ const previewFixes = (
       // file is simply no longer loaded from here), or the imported symbol moves to a new file that
       // still loads the symbol's own imports at this point. Both are replayed; a finding is resolved
       // only if it is gone either way, and whatever fails in one of them is listed.
-      const afters = [collect(evaluateAll(graph, mainEntries, tests, { overrides: { ...overrides, added: new Map() } }))];
-      if (overrides.added.size > 0) afters.push(collect(evaluateAll(graph, mainEntries, tests, { overrides })));
-      const failing = new Map<string, Hit>();
-      for (const after of afters) for (const [key, hit] of after) if (!failing.has(key)) failing.set(key, hit);
-      steps.push({
-        resolved: crashFindings.filter((f) => f.failures.every((fp) => !failsIn(failing, fp) && allReplayed(fp))).map((f) => f.id),
-        remaining: list([...failing].filter(([key, hit]) => before.has(key) && sccByNode.get(hit.from)?.id === plan.sccId).map(([, hit]) => hit)),
-        exposed: list([...failing].filter(([key]) => !before.has(key)).map(([, hit]) => hit)),
-      });
+      const ways: EvalOverrides[] = [{ ...overrides, added: new Map() }];
+      if (overrides.added.size > 0) ways.push({ ...overrides });
+      steps.push(replay.diff(scope.tests, ways, new Set([plan.sccId])));
     }
-    plan.preview = { simulated: true, steps, entries: roots.size, skippedTests: skippedTests || undefined };
+    plan.preview = { simulated: true, steps, entries: replay.mainEntries.length + scope.tests.length, skippedTests: scope.skippedTests || undefined };
   }
+};
+
+/** One import to change in a what-if replay. */
+export interface ImportChange {
+  /** The importing file and the imported file (absolute paths). */
+  from: string;
+  to: string;
+  /**
+   * - `remove`: the import is gone (its symbols moved to a file outside the cycle, the using code
+   *   moved, or the dependency was inverted);
+   * - `direct`: a barrel import replaced by imports of the files that declare the names;
+   * - `defer`: the import stays, but nothing it brings in is read while the file loads any more
+   *   (`forwardRef`, access moved into a function).
+   */
+  action: 'remove' | 'direct' | 'defer';
+}
+
+export interface Simulation extends ReplayDiff {
+  /** False when nothing could be replayed (see `notes`). */
+  simulated: boolean;
+  /** Entry points replayed. */
+  entries: number;
+  skippedTests?: number;
+  /** For `direct` changes: the declaring files each import was redirected to. */
+  redirected: { from: string; to: string; declaringFiles: string[] }[];
+  /** Problems with the request (unknown import, nothing to redirect …). */
+  notes: string[];
+}
+
+/**
+ * Replay the real entry points as if `changes` had been made, without touching any file: which of
+ * today's crashes are gone, what still fails, and what fails that did not fail before.
+ */
+export const simulateChanges = (result: AnalysisResult, changes: ImportChange[]): Simulation => {
+  const { graph } = result;
+  const notes: string[] = [];
+  const redirected: Simulation['redirected'] = [];
+  const overrides: Required<EvalOverrides> = { removed: new Set(), rewired: new Map(), added: new Map(), deferred: new Set() };
+  const cache = new Map<string, ResolvedExport | null>();
+  const rel = (p: string): string => relativeTo(graph.root, p);
+  for (const c of changes) {
+    const edge = graph.out.get(c.from)?.get(c.to);
+    if (!edge || !edge.runtime) {
+      notes.push(`\`${rel(c.from)}\` has no runtime import of \`${rel(c.to)}\` – ignored`);
+      continue;
+    }
+    const key = edgeKey(c.from, c.to);
+    if (c.action === 'remove') overrides.removed.add(key);
+    else if (c.action === 'defer') overrides.deferred.add(key);
+    else {
+      const files = new Set<string>();
+      for (const r of edge.records) {
+        if (r.erased || r.kind === 'dynamic') continue;
+        const names = [
+          ...r.specifiers.filter((sp) => sp.effectiveTiming !== 'unused' && sp.effectiveTiming !== 'type').flatMap((sp) => (sp.imported === '*' ? [...new Set(sp.usages.map((u) => u.member).filter((m): m is string => Boolean(m)))] : [sp.imported])),
+          ...(r.kind === 'reexport' ? (r.reexportedNames ?? []).map((n) => n.imported).filter((n) => n !== '*') : []),
+        ];
+        for (const n of names) {
+          const origin = resolveExport(graph, c.to, n, cache)?.originPath;
+          if (origin && origin !== c.to && origin !== c.from) files.add(origin);
+        }
+      }
+      if (files.size === 0) notes.push(`\`${rel(c.to)}\` declares what \`${rel(c.from)}\` imports itself – there is no other file to import from; treated as unchanged`);
+      else {
+        overrides.rewired.set(key, [...files]);
+        redirected.push({ from: c.from, to: c.to, declaringFiles: [...files] });
+      }
+    }
+  }
+  const empty: Simulation = { simulated: false, entries: 0, resolved: [], remaining: [], exposed: [], redirected, notes };
+  const changed = [...overrides.removed, ...overrides.deferred, ...overrides.rewired.keys()].map((k) => k.split('\0')[0]!);
+  if (changed.length === 0) return { ...empty, notes: notes.length > 0 ? notes : ['no change given'] };
+  const replay = createReplay(graph, result.findings, result.sccs, result.entryFiles.main, result.entryFiles.test, result.entries);
+  const touchedGroups = new Set<number>();
+  for (const s of result.sccs) if (changed.some((f) => s.nodes.includes(f))) touchedGroups.add(s.id);
+  const scope = replay.scope(changed, 1);
+  if (!scope || result.entryFiles.main.length + scope.tests.length === 0) return { ...empty, notes: [...notes, 'no entry point loads the changed files – nothing to replay'] };
+  return {
+    simulated: true,
+    entries: result.entryFiles.main.length + scope.tests.length,
+    skippedTests: scope.skippedTests || undefined,
+    // what still fails is only of interest in the groups that were touched
+    ...replay.diff(scope.tests, [overrides], touchedGroups.size > 0 ? touchedGroups : undefined),
+    redirected,
+    notes,
+  };
 };
 
 /**

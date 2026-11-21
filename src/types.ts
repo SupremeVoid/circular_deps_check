@@ -429,6 +429,11 @@ export interface FailurePoint {
   originPath: string | null;
   originKind: ExportKind;
   state: BindingState;
+  /**
+   * Identity of this read that survives a re-run after unrelated edits: file, symbol, binding and
+   * declaring file – no line numbers (`#n` distinguishes repeated reads of the same binding).
+   */
+  key: string;
   /** Entries under which this failure is triggered. */
   entries: { entry: string; kind: EntryKind; chain: string[] }[];
   /** Order-dependent reads only: number of files that, imported first, trigger it (`entries` keeps three examples). */
@@ -436,7 +441,10 @@ export interface FailurePoint {
 }
 
 export interface Finding {
+  /** Display id of this run (`C1`, `C2` … by severity); changes when findings appear or disappear. */
   id: string;
+  /** Identity that survives a re-run: the import (crashes), the group (cycles) or the services (DI). */
+  key: string;
   severity: Severity;
   kind: FindingKind;
   title: string;
@@ -511,6 +519,8 @@ export interface AnalysisResult {
   graph: ModuleGraph;
   /** Greedy feedback-arc-set style plan per SCC. */
   fixPlans: FixPlan[];
+  /** Absolute paths of the real entry points that were replayed. */
+  entryFiles: { main: string[]; test: string[] };
 }
 
 export interface FixPlan {

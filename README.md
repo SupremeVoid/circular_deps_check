@@ -104,13 +104,71 @@ circdeps [root] [options]
 Run `circdeps --help` for the full list. The same settings can live in a `circdeps.config.json`
 in the project root (`entries`, `testEntries`, `include`, `exclude`, `fixPreview`, …).
 
-Use it from code:
+## Focused questions
+
+The full report of a large project is long. These subcommands print one small answer each – text by
+default, `--json` for scripts:
+
+| Command | Answer |
+| --- | --- |
+| `circdeps summary [root]` | Counts, the problem groups and their fix, a few lines each |
+| `circdeps list [root]` | One line per finding; filter with `--min-severity`, `--kind`, `--file`, `--group` |
+| `circdeps explain <id> [root]` | One finding: failing line, load order, the cycle with its code, fixes |
+| `circdeps plan <group\|id> [root]` | The fix plan of a group and what the replay shows after every step |
+| `circdeps simulate [root] --remove a.ts,b.ts` | What would crash if these imports changed – nothing is edited |
+| `circdeps diff <baseline.json> [root]` | What changed since a saved JSON report; exits 1 on new problems |
+
+`simulate` takes `--remove <from,to>` (the import is gone), `--direct <from,to>` (a barrel import
+replaced by imports of the declaring files) and `--defer <from,to>` (the import stays, nothing of it
+is read at load time – `forwardRef`). Files can be given by a unique path ending:
+
+```bash
+circdeps simulate --direct order-list.component.ts,src/app/shared/index.ts
+```
+
+Finding ids (`C1`, `C2` …) are positions in one run and shift after edits. Every finding also has
+a `key` that stays the same; `diff` and the JSON report use it.
+
+## For AI agents (MCP)
+
+`circdeps mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server over stdio
+with the same questions as tools, so a coding agent can check a project, try a fix on paper and
+verify its own edits. Run `bun run build` once, then register it with your agent host, for example
+in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "circdeps": {
+      "command": "node",
+      "args": ["/path/to/circular_deps_check/bin/circdeps.js", "mcp", "--root", "/path/to/your/project"]
+    }
+  }
+}
+```
+
+| Tool | What the agent gets |
+| --- | --- |
+| `analyze` | A fresh run: counts, verdict, the problem groups and the imports to change |
+| `list_findings` | One line per finding, filtered by severity, kind, file or group |
+| `get_finding` | One finding: failing line, load order, the code behind every import of the cycle, fixes |
+| `get_fix_plan` | The steps for a group and what replaying the entry points shows after each |
+| `simulate_changes` | Before editing: what a set of import changes would resolve, and what would newly fail |
+| `recheck` | After editing: findings resolved, new, and changed since the previous run or the first one |
+
+The server only reads files – the agent makes the edits. Answers are a few kilobytes each, not the
+whole report. `--entry`, `--test-entry`, `--no-tests` and `--tsconfig` work as on the command line,
+and every tool accepts a `root` argument for another project.
+
+## Use it from code
 
 ```ts
-import { analyze } from 'circular-deps-check';
+import { analyze, summarize, explainFinding, simulate } from 'circular-deps-check';
 
 const result = await analyze({ root: '/my/app', entries: ['src/main.ts'] });
-for (const f of result.findings) console.log(f.severity, f.title);
+console.log(summarize(result).verdict);
+console.log(explainFinding(result, 'C1').reads);
+console.log(simulate(result, [{ from: 'src/a.ts', to: 'src/shared/index.ts', action: 'direct' }]).verdict);
 ```
 
 ## How it works
@@ -148,6 +206,8 @@ Nothing is guessed: what cannot be proven is reported as *possible* with the rea
   load order and helps only when that read is the failing one.
 - Top-level `await import()` is treated like any lazy import. Angular `NgModule` remote scoping
   (NG3003) is not modelled.
+- `simulate` and the MCP tools predict load-time reads, not Angular DI cycles, and a medium
+  ("possible") finding still needs a look at the stated reason before anyone "fixes" it.
 
 ## Development
 

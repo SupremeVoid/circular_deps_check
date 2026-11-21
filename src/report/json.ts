@@ -43,6 +43,8 @@ export interface JsonPreviewFailure {
 
 export interface JsonFinding {
   id: string;
+  /** Stable across runs (ids are not): use it to compare two reports. */
+  key: string;
   severity: string;
   kind: string;
   title: string;
@@ -55,6 +57,8 @@ export interface JsonFinding {
     certain: boolean;
   };
   failures: {
+    /** Stable across runs: file, symbol, binding, declaring file (no line numbers). */
+    key: string;
     from: string;
     to: string;
     symbol: string;
@@ -116,6 +120,7 @@ export const toJsonReport = (result: AnalysisResult, version: string, opts: Repo
   const edgeJson = (e: GraphEdge): JsonEdge => ({ from: rel(e.from), to: rel(e.to), usage: e.usage, symbols: edgeSymbols(e), viaBarrel: e.viaBarrel });
   const findingJson = (f: Finding): JsonFinding => ({
     id: f.id,
+    key: f.key,
     severity: f.severity,
     kind: f.kind,
     title: f.title,
@@ -153,6 +158,7 @@ export const toJsonReport = (result: AnalysisResult, version: string, opts: Repo
         }
       : undefined,
     failures: f.failures.map((fp) => ({
+      key: fp.key,
       from: rel(fp.from),
       to: rel(fp.to),
       symbol: fp.symbol,

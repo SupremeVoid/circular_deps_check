@@ -53,6 +53,8 @@ export interface EvalOverrides {
   rewired?: Map<string, string[]>;
   /** Files loaded in place of a removed import: what the new home of a moved symbol imports itself. */
   added?: Map<string, string[]>;
+  /** The import stays, but what it brings in is no longer read while the importing file loads (`forwardRef`, access moved into a function). */
+  deferred?: Set<string>;
 }
 
 export interface EvaluatorOptions {
@@ -90,10 +92,12 @@ export class Evaluator {
   private readonly removed: Set<string> | undefined;
   private readonly rewired: Map<string, string[]> | undefined;
   private readonly groupOf: Map<string, number> | undefined;
+  private readonly deferred: Set<string> | undefined;
 
   constructor(private readonly graph: ModuleGraph, opts: EvaluatorOptions = {}) {
     this.removed = opts.overrides?.removed;
     this.rewired = opts.overrides?.rewired;
+    this.deferred = opts.overrides?.deferred;
     this.groupOf = opts.groupOf;
     const rewired = this.rewired;
     const added = opts.overrides?.added;
@@ -280,6 +284,7 @@ export class Evaluator {
       if (!to || record.external || record.erased || !this.graph.modules.has(to) || to === ctx.module) continue;
       if (record.kind !== 'static' && record.kind !== 'import-equals') continue;
       if (this.isCut(ctx.module, to)) continue; // what-if: these symbols no longer come from the cycle
+      if (this.deferred?.has(edgeKey(ctx.module, to))) continue; // what-if: no load-time read over this import any more
       for (const spec of record.specifiers) {
         for (const usage of spec.usages) {
           if (usage.timing === 'type') continue;
