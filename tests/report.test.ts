@@ -19,6 +19,9 @@ describe('text report', () => {
     // groups with their verified fix come first, before the per-finding details
     expect(text).toContain('Problems – fix these first');
     expect(text).toContain('✖ Group #1: 2 files – 1 critical (C1)');
+    // each problem says how it breaks before how to fix it
+    expect(text).toContain('breaks: C1 src/app/config.ts:4 reads `routes` too early on app start, 3 files into the load');
+    expect(text.indexOf('breaks: C1')).toBeLessThan(text.indexOf('✔ fix (verified, 1 import):'));
     expect(text).toContain('✔ fix (verified, 1 import):');
     expect(text.indexOf('Problems – fix these first')).toBeLessThan(text.indexOf('[C1] CRITICAL'));
     expect(text).toContain('[C5] INFO');
@@ -109,6 +112,11 @@ describe('html report', () => {
     expect(withCycle.cycle!.edges.every((e) => Array.isArray(e.imports) && Array.isArray(e.uses))).toBe(true);
     expect(withCycle.cycle!.edges.some((e) => e.imports!.some((i) => i.text.startsWith('import {')) && e.uses!.length > 0)).toBe(true);
     expect(html).toContain('class="hit"');
+    // cards lead with the evidence of their worst finding, then the fix, then the other findings
+    expect(html).toContain("'How it breaks'");
+    expect(html).toContain("'How to fix'");
+    expect(html).toContain("'Also in this group ('");
+    expect(html.indexOf("findingEvidence(lead, evidence, true)")).toBeLessThan(html.indexOf("fix.appendChild(fb)"));
     expect(html).toContain("tip.id = 'tip'");
   });
 

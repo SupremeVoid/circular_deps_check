@@ -106,6 +106,16 @@ export const renderTextReport = (result: AnalysisResult, opts: TextReportOptions
     const worst = worstOf(list);
     const counts2 = (['critical', 'high', 'medium', 'low', 'info'] as Severity[]).filter((sv) => list.some((f) => f.severity === sv)).map((sv) => `${list.filter((f) => f.severity === sv).length} ${sv}`).join(', ');
     out(`  ${SEV_LABEL[worst](SEV_ICON[worst])} Group #${id}: ${scc?.nodes.length ?? '?'} files – ${counts2} ${c.dim(`(${list.map((f) => f.id).join(', ')})`)}`);
+    // how it breaks first, then the fix
+    const breaks = list.filter((f) => f.failures.length > 0 && f.kind !== 'latent-cycle' && severityRank(f.severity) <= severityRank('medium'));
+    for (const f of breaks.slice(0, 3)) {
+      const fp = f.failures[0]!;
+      const entry = fp.entries[0];
+      const when = !entry ? '' : entry.kind === 'main' ? 'on app start' : entry.kind === 'lazy' ? `when ${rel(entry.entry)} loads` : `when ${rel(entry.entry)} loads (spec)`;
+      const reads = fp.via ? `\`${fp.symbol}${fp.usage.call ? '()' : ''}\` reads \`${fp.binding}\`` : `reads \`${fp.symbol}\``;
+      out(`      ${SEV_LABEL[f.severity](`${f.kind === 'possible-break' ? 'may break' : 'breaks'}:`)} ${f.id} ${rel(fp.from)}:${fp.usage.line} ${reads} too early ${c.dim(`${when}${entry ? `, ${entry.chain.length} files into the load` : ''}`)}`);
+    }
+    if (breaks.length > 3) out(c.dim(`      … ${breaks.length - 3} more`));
     if (plan && plan.cuts.length > 0) renderPlan(plan, rel, out);
   };
   const di = result.findings.filter((f) => f.kind === 'di-cycle');

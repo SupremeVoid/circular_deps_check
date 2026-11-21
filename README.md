@@ -1,14 +1,14 @@
 # circular-deps-check (`circdeps`)
 
 Finds the import cycles in a TypeScript / Angular project that **actually break** – and shows the
-exact line, the load order that leads to it, and a fix that has already been tried out for you.
+exact line, the load order that leads to it, and a potential fix.
 
 <p align="center">
-  <a href="https://supremevoid.github.io/circular_deps_check/sample-report/"><img src="docs/img/report-overview.png" width="760" alt="HTML report of the sample shop app: four load-time crashes, each group with its verified fix"></a>
+  <a href="https://supremevoid.github.io/circular_deps_check/sample-report/"><img src="docs/img/report-overview.png" width="760" alt="HTML report of the sample shop app: a load-time crash with its failing line, load order and cycle diagram, followed by the verified fix"></a>
 </p>
 
 **[Check this sample report →](https://supremevoid.github.io/circular_deps_check/sample-report/)** –
-the live report of a small shop app (65 components) with cycles of 2 to 8 files. Hover the arrows.
+the live report of a small shop app (65 components) with cycles of 2 to 8 files.
 
 ## Quick start
 
@@ -39,15 +39,20 @@ never more than low.
 
 ## The report
 
-Files that can all reach each other form a *group*. One group usually causes several findings and
-one change usually fixes all of them, so each group starts with its **fix** and lists the findings
-below it.
+Files that can all reach each other form a *group*, and each group is one card. A card shows
+
+1. **how it breaks** – the worst finding of the group: the failing line, the load order from your
+   entry point to that line, and the cycle as a diagram;
+2. **how to fix it** – the fewest imports to change, replayed (see below). One change usually fixes
+   every finding of the group;
+3. the other findings of the group, as rows to open.
+
+A group in which nothing breaks today has no first part.
 
 ### The code behind every arrow
 
-Open a finding to see the failing line, the load order from your entry point, and the cycle as a
-diagram. Hover an arrow to see the import statement and the lines that use it – the failing read
-is marked. Click the arrow to keep the popup open; the line numbers then open the file in VS Code.
+Hover an arrow of the diagram to see the import statement and the lines that use it – the failing
+read is marked. Click the arrow to keep the popup open; the line numbers then open the file in VS Code.
 
 <p align="center">
   <img src="docs/img/report-code-popup.png" width="720" alt="A cycle of eight files that only crashes when one spec loads: load order, diagram, and a popup with the import statement and the failing line">

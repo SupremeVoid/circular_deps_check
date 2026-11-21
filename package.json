@@ -1,6 +1,6 @@
 {
   "name": "circular-deps-check",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Circular dependency checker for TypeScript/Angular projects that finds the cycles that actually break at runtime and pinpoints the exact failing edge.",
   "type": "module",
   "license": "MIT",

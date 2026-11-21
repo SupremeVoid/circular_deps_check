@@ -106,6 +106,17 @@ main { padding: 18px 24px 64px; max-width: 1280px; margin: 0 auto; }
 .gate { font-size: 12.5px; margin: 2px 0; }
 .gate .who { color: var(--muted); }
 .rows { border-top: 1px solid var(--border); }
+.sect { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; font-weight: 700; color: var(--muted); padding: 12px 16px 6px; }
+.lead { border-top: 1px solid var(--border); }
+.lead-head { padding: 0 16px 2px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: baseline; }
+.lead-head .what { font-size: 15px; font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+.lead-head .where { color: var(--muted); font-size: 12.5px; font-weight: 400; }
+.lead-head .trig { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.lead-body { padding: 0 16px 14px; }
+.lead-body .summary { margin: 6px 0 10px; }
+.lead .fixbox { margin-top: 0; }
+.lead-fixes { padding: 0 16px 12px; }
+@media (max-width: 760px) { .lead-head { grid-template-columns: auto minmax(0, 1fr); } .lead-head .trig { grid-column: 2; white-space: normal; } }
 details.row { border-bottom: 1px solid var(--border); }
 details.row:last-child { border-bottom: none; }
 details.row > summary { list-style: none; cursor: pointer; padding: 9px 16px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: baseline; }
@@ -137,6 +148,8 @@ details.row[open] > summary .caret { transform: rotate(90deg); }
 @media (max-width: 980px) { .evidence { grid-template-columns: minmax(0, 1fr); } }
 .evidence > * { min-width: 0; }
 .evidence.long { grid-template-columns: minmax(0, 1fr); }
+.evidence:not(.long) .fc .mono { max-width: 20ch; }
+.evidence:not(.long) td.syms { min-width: 150px; }
 .tablewrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
 table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
@@ -430,7 +443,7 @@ const CLIENT_JS = String.raw`
       : c.medium ? 'No proven crash – ' + plural(c.medium, 'possible crash', 'possible crashes') + ' to check'
       : fragile.length ? 'Nothing is broken in any current load order'
       : data.stats.sccs ? 'No crash under any import order' : 'No runtime import cycles';
-    var sub = groups ? 'Changing ' + plural(cuts, 'import') + ' ' + (verified ? '(verified) ' : '') + 'removes every cycle that crashes today – see the fix at the top of each problem below.'
+    var sub = groups ? 'Changing ' + plural(cuts, 'import') + ' ' + (verified ? '(verified) ' : '') + 'removes every cycle that crashes today – each problem below shows how it breaks, then the fix.'
       : fragile.length ? plural(fragileReads, 'load-time read') + ' in ' + plural(fragile.length, 'group') + ' depend' + (fragileReads === 1 ? 's' : '') + ' on today\'s import order (low). Nothing to fix now; untangle when you touch them.'
       : data.stats.sccs ? plural(data.stats.sccs, 'cyclic group') + ' remain, all safe at load time.' : '';
     if (!data.options.entries.length) sub = 'No entry point found – pass --entry src/main.ts so the app load order can be replayed. ' + sub;
@@ -525,7 +538,7 @@ const CLIENT_JS = String.raw`
         ' <span class="muted">{ ' + esc(c.symbols.slice(0, 4).join(', ')) + (c.symbols.length > 4 ? ', …' : '') + ' }</span></span><span class="why">' + md(c.reason) + '</span>' + then + '</div>';
     }).join('');
     var title = plan.verified
-      ? '✔ Fix: change ' + plural(plan.cuts.length, 'import') + ' – verified to make this group acyclic' + (total > 1 ? ', which resolves all ' + total + ' findings below' : '')
+      ? '✔ Fix: change ' + plural(plan.cuts.length, 'import') + ' – verified to make this group acyclic' + (total > 1 ? ', which resolves all ' + total + ' findings of this group' : '')
       : 'Suggested cuts (the group is still cyclic after these – see the findings)';
     var replay = '';
     var last = steps[plan.cuts.length - 1];
@@ -556,11 +569,40 @@ const CLIENT_JS = String.raw`
     el.appendChild(h('div', { class: 'problem-head', html:
       '<h2><span class="badge ' + sev + '">' + sev + '</span> ' + esc(title) + ' <span class="muted" style="font-weight:400">#' + id + '</span> ' + countChips(all) + '</h2>' +
       '<div class="facts">' + plural(g.files.length, 'file') + ' · ' + plural(g.edgeCount, 'import') + (g.barrels.length ? ' · ' + plural(g.barrels.length, 'barrel') + ' (' + g.barrels.slice(0, 3).map(function (b) { return esc(short(b)); }).join(', ') + (g.barrels.length > 3 ? ', …' : '') + ')' : '') + ' · ' + plural(g.cycles.length, 'cycle') + (g.truncated ? '+' : '') + '</div>' }));
+    // How it breaks comes first: the worst finding of the group is shown in full – failing line,
+    // load order, cycle diagram – then the fix, then the other findings of the group as rows.
+    // A group in which nothing breaks today has no such part and starts with its rows.
+    var lead = shown.filter(function (f) { return f.failures.length && f.kind !== 'latent-cycle' && RANK[f.severity] <= RANK.medium; })[0];
     var fb = fixBox(planOf(id), all.length);
-    if (fb) el.appendChild(fb);
-    var rows = h('div', { class: 'rows' });
-    shown.forEach(function (f) { rows.appendChild(findingRow(f, shown.length === 1)); });
-    el.appendChild(rows);
+    if (lead) {
+      var how = h('div', { class: 'lead', id: lead.id });
+      how.appendChild(h('div', { class: 'sect' }, [lead.kind === 'possible-break' ? 'How it may break' : 'How it breaks']));
+      how.appendChild(h('div', { class: 'lead-head', html: headHtml(lead, false) }));
+      var evidence = h('div', { class: 'lead-body' });
+      findingEvidence(lead, evidence, true);
+      how.appendChild(evidence);
+      el.appendChild(how);
+      var fix = h('div', { class: 'lead' });
+      fix.appendChild(h('div', { class: 'sect' }, ['How to fix']));
+      if (fb) fix.appendChild(fb);
+      if (lead.suggestions.length) {
+        var own = h('div', { class: 'lead-fixes' });
+        if (fb) {
+          var more = h('details', { class: 'more' }, [h('summary', {}, ['Ways to fix this read on its own (' + lead.suggestions.length + ')'])]);
+          findingFixes(lead, more, true);
+          own.appendChild(more);
+        } else findingFixes(lead, own, true);
+        fix.appendChild(own);
+      }
+      el.appendChild(fix);
+    } else if (fb) el.appendChild(fb);
+    var rest = shown.filter(function (f) { return f !== lead; });
+    if (rest.length) {
+      var rows = h('div', { class: 'rows' });
+      if (lead) rows.appendChild(h('div', { class: 'sect' }, ['Also in this group (' + rest.length + ')']));
+      rest.forEach(function (f) { rows.appendChild(findingRow(f, !lead && rest.length === 1)); });
+      el.appendChild(rows);
+    }
     var foot = h('div', { class: 'foot' });
     var files = h('details', {}, [h('summary', {}, ['Files in this group (' + g.files.length + ')'])]);
     files.appendChild(h('div', { class: 'files mono', html: g.files.map(function (f) { return '<div>' + (g.barrels.indexOf(f) >= 0 ? tag('barrel', 'barrel') + ' ' : '') + esc(f) + '</div>'; }).join('') }));
@@ -600,9 +642,8 @@ const CLIENT_JS = String.raw`
     return '';
   }
 
-  function findingRow(f, open) {
-    var d = h('details', { class: 'row', id: f.id });
-    if (open) d.open = true;
+  /** Badge, what happens, where, and under which entry – the summary line of a row or of the lead finding. */
+  function headHtml(f, caret) {
     var fp = f.failures[0];
     var what = f.kind === 'latent-cycle'
       ? plural(f.failures.length, 'load-time read') + ' that ' + (f.failures.length === 1 ? 'relies' : 'rely') + ' on today\'s import order'
@@ -610,7 +651,13 @@ const CLIENT_JS = String.raw`
       ? (fp.via ? '<code>' + esc(fp.symbol) + '()</code> reads <code>' + esc(fp.binding) + '</code> too early' : '<code>' + esc(fp.symbol) + '</code> read too early')
       : f.kind === 'deferred-cycle' ? md(f.title.replace(/: \d+ files \(group #\d+\)$/, '')) : md(f.title);
     var where = fp && f.kind !== 'latent-cycle' ? ' <span class="where mono">' + esc(short(fp.from)) + ':' + fp.line + '</span>' : '';
-    d.appendChild(h('summary', { html: '<span><span class="caret">▸</span> <span class="badge ' + f.severity + '">' + f.severity + '</span></span><span class="what">' + what + where + '</span><span class="trig">' + esc(triggerText(f)) + '</span>' }));
+    return '<span>' + (caret ? '<span class="caret">▸</span> ' : '') + '<span class="badge ' + f.severity + '">' + f.severity + '</span></span><span class="what">' + what + where + '</span><span class="trig">' + esc(triggerText(f)) + (caret ? '' : ' · ' + esc(f.id)) + '</span>';
+  }
+
+  function findingRow(f, open) {
+    var d = h('details', { class: 'row', id: f.id });
+    if (open) d.open = true;
+    d.appendChild(h('summary', { html: headHtml(f, true) }));
     var body = null;
     d.addEventListener('toggle', function () { if (d.open && !body) { body = findingDetail(f); d.appendChild(body); } });
     if (open) { body = findingDetail(f); d.appendChild(body); }
@@ -640,7 +687,15 @@ const CLIENT_JS = String.raw`
 
   function findingDetail(f) {
     var el = h('div', { class: 'detail' });
-    el.appendChild(h('div', { class: 'summary', html: md(f.summary) }));
+    findingEvidence(f, el, false);
+    findingFixes(f, el, false);
+    return el;
+  }
+
+  /** How it breaks: the summary, the failing line(s), the load order and the cycle with its diagram. */
+  function findingEvidence(f, el, lead) {
+    // the lead finding of a card has its headline right above: no need to say it twice
+    if (!lead) el.appendChild(h('div', { class: 'summary', html: md(f.summary) }));
 
     if (f.kind === 'latent-cycle') {
       var gates = f.enteredThrough || [];
@@ -665,7 +720,7 @@ const CLIENT_JS = String.raw`
       el.appendChild(tbl);
       if (f.failures.length > 12) el.appendChild(h('button', { class: 'linkbtn', onclick: function (e) { tbl.innerHTML = rowsHtml(f.failures.length); e.target.remove(); } }, ['Show all ' + f.failures.length + ' reads']));
     } else if (f.failures.length) {
-      el.appendChild(h('div', { class: 'st' }, ['Where it breaks']));
+      el.appendChild(h('div', { class: 'st' }, [f.failures.length > 1 ? 'Failing lines' : 'Failing line']));
       el.appendChild(h('div', { html: f.failures.slice(0, 3).map(failureBlock).join('') }));
       if (f.failures.length > 3) el.appendChild(h('div', { class: 'muted' }, ['… ' + (f.failures.length - 3) + ' more reads on the same import']));
       var fp = f.failures[0];
@@ -694,18 +749,27 @@ const CLIENT_JS = String.raw`
       var dia = h('div', { class: 'diagram', html: ring(f.cycle.nodes, f.cycle.edges, failing) + LEGEND + DIAGRAM_HINT });
       bindTips(dia, f.cycle.edges, failing);
       ev.appendChild(dia);
-      ev.appendChild(h('div', { class: 'tablewrap', html: '<table><thead><tr><th>File</th><th>imports</th><th>Use</th><th>Symbols · where</th></tr></thead><tbody>' + f.cycle.edges.map(function (e) {
+      var table = h('div', { class: 'tablewrap', html: '<table><thead><tr><th>File</th><th>imports</th><th>Use</th><th>Symbols · where</th></tr></thead><tbody>' + f.cycle.edges.map(function (e) {
         var isFail = failing.some(function (x) { return x.from === e.from && x.to === e.to; });
         var where = e.sample && e.usage !== 'none' ? '<div class="muted" style="font-size:11.5px">' + md(e.sample.context) + ' · L' + e.sample.line + '</div>' : '';
         return '<tr class="' + (isFail ? 'fail' : '') + '"><td>' + fileCell(e.from) + '</td><td>' + fileCell(e.to) + (e.viaBarrel ? ' ' + tag('barrel', 'barrel') : '') + '</td><td>' + usageTag(e.usage) + (isFail ? ' ⚡' : '') + '</td><td class="syms">' + esc(e.symbols.slice(0, 4).join(', ')) + (e.symbols.length > 4 ? ', …' : '') + where + '</td></tr>';
-      }).join('') + '</tbody></table>' }));
+      }).join('') + '</tbody></table>' });
+      if (lead && f.cycle.nodes.length > 5) {
+        // a long cycle: the diagram (with its code popups) carries the picture, the table is one click away
+        var all = h('details', { class: 'more' }, [h('summary', {}, ['The ' + f.cycle.edges.length + ' imports of this cycle as a table'])]);
+        all.appendChild(h('div', { style: 'margin-top:6px' }, [table]));
+        ev.appendChild(h('div', {}, [all]));
+      } else ev.appendChild(table);
       el.appendChild(ev);
     }
+  }
 
+  /** The fix options of one finding (the group's plan is shown separately). */
+  function findingFixes(f, el, plain) {
     var good = f.suggestions.filter(function (s) { return s.verified; });
     var other = f.suggestions.filter(function (s) { return !s.verified; });
     if (f.suggestions.length) {
-      el.appendChild(h('div', { class: 'st' }, [good.length ? 'How to fix' : 'What to do']));
+      if (!plain) el.appendChild(h('div', { class: 'st' }, [good.length ? 'How to fix' : 'What to do']));
       (good.length ? good : other).forEach(function (s) { el.appendChild(fixHtml(s, good.length > 0)); });
       if (good.length && other.length) {
         var more = h('details', { class: 'more' }, [h('summary', {}, ['Other options considered (' + other.length + ') – not sufficient on their own'])]);
@@ -713,7 +777,6 @@ const CLIENT_JS = String.raw`
         el.appendChild(more);
       }
     }
-    return el;
   }
 
   function fixHtml(s, verified) {
@@ -727,8 +790,9 @@ const CLIENT_JS = String.raw`
   function diCard(f) {
     var el = h('section', { class: 'problem ' + f.severity, id: f.id });
     el.appendChild(h('div', { class: 'problem-head', html: '<h2><span class="badge ' + f.severity + '">' + f.severity + '</span> Angular DI cycle (NG0200) <span class="chip">' + (f.di.certain ? 'certain' : 'verify: @SkipSelf/@Host involved') + '</span></h2><div class="facts">' + esc(f.di.nodes.map(function (n) { return n.name; }).join(' → ') + ' → ' + f.di.nodes[0].name) + '</div>' }));
-    var body = h('div', { class: 'detail', style: 'padding-left:16px' });
-    body.appendChild(h('div', { class: 'summary', html: md(f.summary) }));
+    el.appendChild(h('div', { class: 'lead' }, [h('div', { class: 'sect' }, ['How it breaks'])]));
+    var body = h('div', { class: 'lead-body' });
+    body.appendChild(h('div', { class: 'summary', style: 'margin-top:0', html: md(f.summary) }));
     var ev = h('div', { class: 'evidence' });
     var names = f.di.nodes.map(function (n) { return n.name; });
     var edges = f.di.edges.map(function (e, i) {
@@ -743,9 +807,12 @@ const CLIENT_JS = String.raw`
       return '<tr><td><b>' + esc(e.from) + '</b> → <b>' + esc(e.to) + '</b></td><td>' + loc(e.path, e.line) + '</td><td>' + esc(e.via) + (e.flags.length ? ' (' + e.flags.map(function (x) { return '@' + x; }).join(' ') + ')' : '') + '</td></tr>';
     }).join('') + '</tbody></table>' }));
     body.appendChild(ev);
-    body.appendChild(h('div', { class: 'st' }, ['How to fix']));
-    f.suggestions.forEach(function (s) { body.appendChild(fixHtml(s, true)); });
     el.appendChild(body);
+    var fix = h('div', { class: 'lead' }, [h('div', { class: 'sect' }, ['How to fix'])]);
+    var fixes = h('div', { class: 'lead-fixes' });
+    f.suggestions.forEach(function (s) { fixes.appendChild(fixHtml(s, true)); });
+    fix.appendChild(fixes);
+    el.appendChild(fix);
     return el;
   }
 
@@ -787,7 +854,7 @@ const CLIENT_JS = String.raw`
       '<h3>Why a new finding can appear after a fix</h3>',
       '<p>Changing an import changes the load order, and a read that was safe can become the next crash. Such reads are the <em>order-dependent</em> ones (low). To take the surprise out, each fix plan is replayed: the entry points are loaded again with the plan applied one change at a time, and a line “then: next crash – …” names what would surface after that step. “No crash left, none surfaces elsewhere” means the full plan was replayed clean.</p>',
       '<h3>Problems = cyclic groups</h3>',
-      '<p>Files that can all reach each other form a group. One group usually produces several findings, and one change usually fixes all of them, so findings are grouped and the <b>verified fix</b> (the fewest imports to change so the group becomes acyclic) is shown first. Barrel imports are rewired to the files that declare the symbols, and the plan is only marked verified when the rewired graph is acyclic.</p>',
+      '<p>Files that can all reach each other form a group, and each group is one card. A card first shows <b>how it breaks</b> – the worst finding of the group with its failing line, the load order from the entry point and the cycle as a diagram (hover an arrow for the code). Then <b>how to fix</b> it: the fewest imports to change so the group becomes acyclic, replayed step by step. One change usually fixes every finding of a group; the other findings follow as rows. A group in which nothing breaks today starts with its fix plan and rows. Angular DI cycles get a card of their own with the same order.</p>',
       '<h3>Read at load time vs. later</h3>',
       '<ul><li><b>Load time</b>: top-level code, <code>extends</code>, decorator arguments (<code>@Component({ imports, providers })</code>), static fields, enum initialisers, route arrays, callbacks of <code>.map()</code>/<code>.forEach()</code>, and anything inside functions called while the module loads – including functions in other files.</li>',
       '<li><b>Later</b>: function and method bodies, constructors, instance fields (<code>inject()</code>), arrow functions, <code>forwardRef(() =&gt; X)</code>, <code>loadComponent: () =&gt; import(...)</code>.</li>',
