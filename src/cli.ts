@@ -27,8 +27,9 @@ const HELP = `circdeps – circular dependency checker for TypeScript / Angular 
 Usage: circdeps [root] [options]
 
 Finds import cycles, replays the ES-module evaluation order from your entry points and reports
-only the cycles that really break (TDZ / undefined at load time), Angular DI cycles (NG0200),
-and order-dependent cycles – with verified fix suggestions.
+the cycles that really break (TDZ / undefined at load time) and Angular DI cycles (NG0200) –
+with fix plans that are replayed to show what is left afterwards. Cycles that only depend on
+the import order are listed separately as low.
 
 Options:
   --tsconfig <path>        tsconfig used for path aliases (auto-detected)
@@ -38,6 +39,8 @@ Options:
   --test-entry <glob>      test entry glob(s), repeatable (default: **/*.spec.ts)
   --no-tests               do not evaluate test entries
   --out <dir>              report directory (default: ./reports); writes circular-deps.{txt,html,json}
+  --display-root <text>    show this instead of the absolute project path (reports that leave the
+                           machine: CI artifacts, published samples); switches editor links off
   --format <list>          comma separated: text,html,json (default: text,html,json)
   --fail-on <severity>     exit 1 when a finding of this severity or worse exists
                            (critical|high|medium|low|info|none; default: high)
@@ -48,6 +51,7 @@ Options:
   --json                   print the JSON report to stdout instead of text
   --no-color               disable ANSI colors
   --no-angular             skip Angular DI analysis
+  --no-fix-preview         do not replay the entry points with each fix plan applied
   --emit-decorator-metadata  force emitDecoratorMetadata semantics (constructor param types are values)
   -h, --help               show this help
   -v, --version            show version
@@ -66,6 +70,7 @@ export const runCli = async (argv: string[]): Promise<number> => {
       'test-entry': { type: 'string' as const, multiple: true },
       'no-tests': { type: 'boolean' as const },
       out: { type: 'string' as const },
+      'display-root': { type: 'string' as const },
       format: { type: 'string' as const },
       'fail-on': { type: 'string' as const },
       'max-cycles': { type: 'string' as const },
@@ -75,6 +80,7 @@ export const runCli = async (argv: string[]): Promise<number> => {
       json: { type: 'boolean' as const },
       'no-color': { type: 'boolean' as const },
       'no-angular': { type: 'boolean' as const },
+      'no-fix-preview': { type: 'boolean' as const },
       'emit-decorator-metadata': { type: 'boolean' as const },
       help: { type: 'boolean' as const, short: 'h' },
       version: { type: 'boolean' as const, short: 'v' },
@@ -132,6 +138,7 @@ export const runCli = async (argv: string[]): Promise<number> => {
         maxCyclesPerScc: values['max-cycles'] ? Number(values['max-cycles']) : undefined,
         maxFindingsPerSeverity: values['max-findings'] ? Number(values['max-findings']) : undefined,
         angular: values['no-angular'] ? false : undefined,
+        fixPreview: values['no-fix-preview'] ? false : undefined,
         emitDecoratorMetadata: values['emit-decorator-metadata'] ? true : undefined,
       },
       (phase) => log(`… ${phase}`),
@@ -141,19 +148,20 @@ export const runCli = async (argv: string[]): Promise<number> => {
     return 2;
   }
 
+  const reportOpts = { displayRoot: values['display-root'] };
   const written: string[] = [];
   const htmlPath = path.join(outDir, 'circular-deps.html');
   if (formats.has('html') || formats.has('json') || formats.has('text')) fs.mkdirSync(outDir, { recursive: true });
   if (formats.has('html')) {
-    fs.writeFileSync(htmlPath, renderHtmlReport(result, version), 'utf8');
+    fs.writeFileSync(htmlPath, renderHtmlReport(result, version, reportOpts), 'utf8');
     written.push(htmlPath);
   }
   if (formats.has('json')) {
     const p = path.join(outDir, 'circular-deps.json');
-    fs.writeFileSync(p, JSON.stringify(toJsonReport(result, version), null, 2), 'utf8');
+    fs.writeFileSync(p, JSON.stringify(toJsonReport(result, version, reportOpts), null, 2), 'utf8');
     written.push(p);
   }
-  const textOpts = { verbose: values.verbose, quiet: values.quiet, maxPerSeverity: values['max-findings'] ? Number(values['max-findings']) : undefined, htmlPath: formats.has('html') ? htmlPath : undefined };
+  const textOpts = { displayRoot: values['display-root'], verbose: values.verbose, quiet: values.quiet, maxPerSeverity: values['max-findings'] ? Number(values['max-findings']) : undefined, htmlPath: formats.has('html') ? htmlPath : undefined };
   if (formats.has('text')) {
     const p = path.join(outDir, 'circular-deps.txt');
     const prev = process.stdout.isTTY;
@@ -165,7 +173,7 @@ export const runCli = async (argv: string[]): Promise<number> => {
   }
 
   if (values.json) {
-    process.stdout.write(`${JSON.stringify(toJsonReport(result, version), null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(toJsonReport(result, version, reportOpts), null, 2)}\n`);
   } else {
     process.stdout.write(`${renderTextReport(result, textOpts)}\n`);
     if (written.length > 0) process.stdout.write(`${c.dim(`Reports written: ${written.map((w) => path.relative(process.cwd(), w)).join(', ')}`)}\n`);

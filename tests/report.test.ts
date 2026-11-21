@@ -49,7 +49,7 @@ describe('text report', () => {
     const r = await analyzeFixture('01-basic');
     setColor(false);
     const text = renderTextReport(r, { verbose: true, maxPerSeverity: 1 });
-    expect(text).toContain('… 1 more low findings');
+    expect(text).toContain('… 2 more info findings');
   });
 });
 
@@ -72,6 +72,21 @@ describe('json report', () => {
   });
 });
 
+describe('display root', () => {
+  it('replaces the path on this machine in every report and switches editor links off', async () => {
+    const r = await analyzeFixture('02-barrels');
+    const json = toJsonReport(r, '1', { displayRoot: 'my-app' });
+    expect(json.root).toBe('my-app');
+    expect(json.editorLinks).toBe(false);
+    expect(toJsonReport(r, '1').editorLinks).toBe(true);
+    expect(JSON.stringify(json)).not.toContain(r.root);
+    const html = renderHtmlReport(r, '1', { displayRoot: 'my-app' });
+    expect(html).not.toContain(r.root);
+    setColor(false);
+    expect(renderTextReport(r, { displayRoot: 'my-app' })).toContain('circular-deps-check  my-app');
+  });
+});
+
 describe('html report', () => {
   it('is self-contained, embeds the data safely and renders all sections', async () => {
     const r = await analyzeFixture('03-angular-app');
@@ -89,6 +104,12 @@ describe('html report', () => {
     expect(html).toContain('Problems (');
     expect(html).toContain('vscode://file/');
     expect(html).toContain('forwardRef');
+    // the code popup of the cycle diagram: edges carry their import statement and usage lines
+    const withCycle = (embedded.findings as { cycle?: { edges: { imports?: { line: number; text: string }[]; uses?: { line: number; snippet: string }[] }[] } }[]).find((f) => f.cycle)!;
+    expect(withCycle.cycle!.edges.every((e) => Array.isArray(e.imports) && Array.isArray(e.uses))).toBe(true);
+    expect(withCycle.cycle!.edges.some((e) => e.imports!.some((i) => i.text.startsWith('import {')) && e.uses!.length > 0)).toBe(true);
+    expect(html).toContain('class="hit"');
+    expect(html).toContain("tip.id = 'tip'");
   });
 
   it('escapes closing script tags inside the data', async () => {

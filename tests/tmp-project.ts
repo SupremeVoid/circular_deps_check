@@ -12,7 +12,7 @@ const TSCONFIG = JSON.stringify({
 /** Create a throw-away project from a `relative path -> source` map and analyze it. */
 export const analyzeProject = async (
   files: Record<string, string>,
-  opts: { entries?: string[]; testEntries?: string[]; noTestEntries?: boolean; emitDecoratorMetadata?: boolean; angular?: boolean; compilerOptions?: Record<string, unknown>; include?: string[] } = {},
+  opts: { entries?: string[]; testEntries?: string[]; noTestEntries?: boolean; emitDecoratorMetadata?: boolean; angular?: boolean; compilerOptions?: Record<string, unknown>; include?: string[]; fixPreview?: boolean } = {},
 ): Promise<AnalysisResult & { dir: string; file: (rel: string) => string }> => {
   const dir = normalizePath(fs.mkdtempSync(path.join(os.tmpdir(), 'circdeps-proj-')));
   const tsconfig = JSON.parse(TSCONFIG) as { compilerOptions: Record<string, unknown> };
@@ -23,6 +23,6 @@ export const analyzeProject = async (
     fs.mkdirSync(path.dirname(p), { recursive: true });
     fs.writeFileSync(p, src);
   }
-  const result = await analyze({ root: dir, entries: opts.entries ?? ['src/main.ts'], noTestEntries: opts.noTestEntries ?? true, testEntries: opts.testEntries, emitDecoratorMetadata: opts.emitDecoratorMetadata, angular: opts.angular, include: opts.include });
+  const result = await analyze({ root: dir, entries: opts.entries ?? ['src/main.ts'], noTestEntries: opts.noTestEntries ?? true, testEntries: opts.testEntries, emitDecoratorMetadata: opts.emitDecoratorMetadata, angular: opts.angular, include: opts.include, fixPreview: opts.fixPreview });
   return Object.assign(result, { dir, file: (rel: string) => normalizePath(path.join(dir, rel)) });
 };

@@ -55,6 +55,8 @@ export interface Usage {
   assumed?: string;
   /** Callee of a decorator factory call (`@Register('x')`): the returned decorator also runs at class definition. */
   decoratorFactory?: boolean;
+  /** Namespace imports: `ns.Member.method()` is called here – `method` is the invoked static method of `Member`. */
+  staticCall?: string;
 }
 
 export interface ImportSpecifierInfo {
@@ -124,6 +126,9 @@ export interface ExportRecord {
   /** Function declarations are hoisted and initialised before any module body runs. */
   hoisted: boolean;
   line: number;
+  /** Where the declaration ends: the binding is initialised only once the whole declaration has run. */
+  endLine?: number;
+  endColumn?: number;
   /** Name of the top-level declaration in this module that backs the export (absent for re-exports / `export default expr`). */
   localName?: string;
   /** For re-exports: resolved path of the source module (null if unresolved). */
@@ -141,6 +146,9 @@ export interface ExportRecord {
 export interface TopLevelDecl {
   kind: ExportKind;
   line: number;
+  /** Where the declaration ends (a class with static initialisers or a multi-line initialiser is not ready before). */
+  endLine?: number;
+  endColumn?: number;
 }
 
 /**
@@ -155,12 +163,18 @@ export interface FootprintRef {
   conditional?: boolean;
   /** Read inside a callback that is only assumed to run synchronously. */
   assumed?: string;
+  /** Namespace imports: `ns.Member.method()` – the invoked static method. */
+  method?: string;
+  /** The base class of an instantiated class: its constructor and fields run, but the binding itself is not read again. */
+  inherit?: boolean;
 }
 
 export interface Footprint {
   line: number;
   imports: (FootprintRef & { local: string; member?: string })[];
   locals: (FootprintRef & { name: string; member?: string })[];
+  /** A static getter / object-literal getter: merely reading the property runs it. */
+  getter?: boolean;
   /** References inside a function the callee returns (followed for decorator factories: the result is applied at once). */
   returned: { imports: (FootprintRef & { local: string; member?: string })[]; locals: (FootprintRef & { name: string; member?: string })[] };
 }
@@ -179,11 +193,15 @@ export interface DiDependency {
   column: number;
   via: 'constructor-param' | 'inject-field' | 'inject-constructor' | 'provider' | 'token-factory';
   flags: DiDependencyFlags;
+  /** Trimmed source line of the injection. */
+  snippet?: string;
 }
 
 export interface ProviderInfo {
   provide: string;
   line: number;
+  /** Trimmed source line of the provider. */
+  snippet?: string;
   useClass?: string;
   useExisting?: string;
   /** `deps: [...]` entries and tokens passed to `inject()` inside `useFactory`. */
@@ -327,8 +345,12 @@ export interface EdgeBreakage {
 export interface EntryEvaluation {
   entry: string;
   kind: EntryKind;
+  /** The real entry point this evaluation belongs to (for a lazy chunk: the app entry that leads to it). */
+  root: string;
   breakages: EdgeBreakage[];
   evaluatedCount: number;
+  /** First file of each cyclic group (by group id) that this evaluation loaded – it alone fixes the group's internal order. */
+  gateways: Map<number, string>;
 }
 
 export interface DiNode {
@@ -362,8 +384,13 @@ export type FindingKind =
   | 'runtime-break'
   /** Crashes only when a spec file is the entry. */
   | 'test-break'
+  /** Reached in a real load order, but whether the read runs depends on something the analysis cannot prove. */
+  | 'possible-break'
   | 'di-cycle'
-  /** Crashes if a file of the cyclic group is imported first (proven by replaying that order). */
+  /**
+   * Works in every current load order; reads that would crash if another file of the cyclic group
+   * were imported first (proven by replaying that order). One finding per cyclic group.
+   */
   | 'latent-cycle'
   /** Runtime import cycle that cannot crash under any load order (one finding per cyclic group). */
   | 'deferred-cycle'
@@ -404,6 +431,8 @@ export interface FailurePoint {
   state: BindingState;
   /** Entries under which this failure is triggered. */
   entries: { entry: string; kind: EntryKind; chain: string[] }[];
+  /** Order-dependent reads only: number of files that, imported first, trigger it (`entries` keeps three examples). */
+  triggerCount?: number;
 }
 
 export interface Finding {
@@ -419,6 +448,17 @@ export interface Finding {
   suggestions: Suggestion[];
   /** Cycle-level edge annotations for the report. */
   edgeNotes: EdgeNote[];
+  /** For `latent-cycle`: how today's entry points enter the group (the reason nothing crashes). */
+  enteredThrough?: GroupGateway[];
+}
+
+/** A file through which real entry points first reach a cyclic group. */
+export interface GroupGateway {
+  file: string;
+  /** Number of app entries / lazy chunks / spec files whose load reaches the group through `file` first. */
+  main: number;
+  lazy: number;
+  test: number;
 }
 
 export interface EdgeNote {
@@ -429,6 +469,12 @@ export interface EdgeNote {
   viaBarrel: boolean;
   /** Strongest usage sample for display. */
   sample?: Usage & { symbol: string };
+  /** The import statement(s) behind the edge, written on one line each. */
+  imports: { line: number; text: string }[];
+  /** The lines that use the imported bindings: load-time reads first, at most six. */
+  uses: (Usage & { symbol: string })[];
+  /** Further usages not listed in `uses`. */
+  moreUses: number;
 }
 
 export interface AnalysisStats {
@@ -479,9 +525,52 @@ export interface FixPlan {
     action: 'rewire-barrel' | 'drop-reexport' | 'move-code' | 'remove-import';
     /** For rewire-barrel: the declaring files the import is redirected to. */
     rewiredTo?: string[];
+    /** For a symbol that moves to a new file: the project files it imports itself – its new home still loads them. */
+    loadsInstead?: string[];
     reason: string;
   }[];
   verified: boolean;
+  /** Result of replaying every real entry point with the cuts applied (only for groups that crash today). */
+  preview?: FixPreview;
+}
+
+/** A read that fails when the real entry points are replayed with a (partial) fix applied. */
+export interface PreviewFailure {
+  from: string;
+  line: number;
+  column: number;
+  symbol: string;
+  binding: string;
+  sccId: number;
+  /** One real entry under which it fails. */
+  entry: string;
+  entryKind: EntryKind;
+  uncertain?: string;
+  /** Finding that already lists this read (e.g. as order-dependent, or as a crash that only specs hit today). */
+  knownAs?: string;
+  knownKind?: FindingKind;
+}
+
+/** State after applying `cuts[0..i]` of a fix plan. */
+export interface FixPreviewStep {
+  /** Findings whose crash no longer occurs. */
+  resolved: string[];
+  /** Reads of this group that still fail under a real entry. */
+  remaining: PreviewFailure[];
+  /** Reads that did not fail before and fail now, because the change altered the load order. */
+  exposed: PreviewFailure[];
+}
+
+export interface FixPreview {
+  /** False when the plan could not be replayed (reason given). */
+  simulated: boolean;
+  reason?: string;
+  /** One step per cut, cumulative. */
+  steps: FixPreviewStep[];
+  /** Real entry points replayed per step. */
+  entries: number;
+  /** Spec files that load the changed files but were left out to keep the replay cheap (app entries only). */
+  skippedTests?: number;
 }
 
 export interface ResolvedOptionsSummary {

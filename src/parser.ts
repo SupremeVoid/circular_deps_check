@@ -100,6 +100,8 @@ class FileParser {
   /** Local functions/classes invoked in an eager context (module load). */
   private readonly eagerInvoked = new Set<string>();
   private readonly localCallables = new Map<string, ts.Node>();
+  /** Keys of `localCallables` that are getters (`Class.prop` / `obj.prop`): reading the property runs them. */
+  private readonly getters = new Set<string>();
   private readonly topLevel: Record<string, TopLevelDecl> = {};
   private readonly declDeps: Record<string, { imports: string[]; locals: string[] }> = {};
   private readonly rootProviders: ProviderInfo[] = [];
@@ -176,6 +178,12 @@ class FileParser {
   private pos(node: ts.Node): { line: number; column: number } {
     const lc = this.sf.getLineAndCharacterOfPosition(node.getStart(this.sf));
     return { line: lc.line + 1, column: lc.character + 1 };
+  }
+
+  /** Start and end of a declaration: its binding is initialised when the end is reached, not before. */
+  private span(node: ts.Node): { line: number; endLine: number; endColumn: number } {
+    const end = this.sf.getLineAndCharacterOfPosition(node.getEnd());
+    return { line: this.pos(node).line, endLine: end.line + 1, endColumn: end.character + 1 };
   }
 
   private makeRecord(
@@ -327,8 +335,12 @@ class FileParser {
       for (const m of stmt.members) {
         const isStatic = ts.canHaveModifiers(m) && Boolean(ts.getModifiers(m)?.some((x) => x.kind === ts.SyntaxKind.StaticKeyword));
         if (isStatic && ts.isMethodDeclaration(m) && m.body && m.name && ts.isIdentifier(m.name)) this.localCallables.set(`${name}.${m.name.text}`, m);
+        if (isStatic && ts.isGetAccessor(m) && m.body && ts.isIdentifier(m.name)) {
+          this.localCallables.set(`${name}.${m.name.text}`, m);
+          this.getters.add(`${name}.${m.name.text}`);
+        }
       }
-      this.topLevel[name] = { kind: isDeclare ? 'type' : 'class', line: this.pos(stmt).line };
+      this.topLevel[name] = { kind: isDeclare ? 'type' : 'class', ...this.span(stmt) };
       if (isExported) this.addExport(isDefault ? 'default' : name, isDeclare ? 'type' : 'class', false, stmt, name);
       return;
     }
@@ -352,7 +364,9 @@ class FileParser {
           if (decl.initializer && (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer))) {
             this.localCallables.set(name, decl.initializer);
           }
-          this.topLevel[name] = { kind: isDeclare ? 'type' : kind, line: this.pos(decl).line };
+          // `export const Utils = { make() { … }, get value() { … }, run: () => … }` – a singleton with methods.
+          if (ts.isIdentifier(decl.name) && decl.initializer) this.collectObjectMethods(name, decl.initializer);
+          this.topLevel[name] = { kind: isDeclare ? 'type' : kind, ...this.span(decl) };
           if (isExported) this.addExport(name, isDeclare ? 'type' : kind, false, decl, name);
         }
       }
@@ -365,7 +379,7 @@ class FileParser {
       // so importers never reference the enum object; with isolatedModules the import and the
       // runtime member access stay (verified against tsc 5.9 emit).
       const isConstEnum = Boolean(mods?.some((m) => m.kind === ts.SyntaxKind.ConstKeyword));
-      this.topLevel[stmt.name.text] = { kind: isDeclare ? 'type' : 'enum', line: this.pos(stmt).line };
+      this.topLevel[stmt.name.text] = { kind: isDeclare ? 'type' : 'enum', ...this.span(stmt) };
       if (isExported) this.addExport(stmt.name.text, isDeclare || (isConstEnum && !this.ctx.isolatedModules) ? 'type' : 'enum', false, stmt, stmt.name.text);
       return;
     }
@@ -385,7 +399,7 @@ class FileParser {
       this.localClasses.push(name);
       // Namespaces that contain only types emit nothing.
       const instantiated = !isDeclare && (ts as unknown as { getModuleInstanceState(n: ts.Node): number }).getModuleInstanceState(stmt) !== 0;
-      this.topLevel[name] = { kind: instantiated ? 'namespace' : 'type', line: this.pos(stmt).line };
+      this.topLevel[name] = { kind: instantiated ? 'namespace' : 'type', ...this.span(stmt) };
       if (isExported) this.addExport(name, instantiated ? 'namespace' : 'type', false, stmt, name);
       return;
     }
@@ -395,10 +409,25 @@ class FileParser {
     }
   }
 
+  private collectObjectMethods(name: string, init: ts.Expression): void {
+    let obj = init;
+    while (ts.isParenthesizedExpression(obj) || ts.isAsExpression(obj) || ts.isSatisfiesExpression(obj)) obj = obj.expression;
+    if (!ts.isObjectLiteralExpression(obj)) return;
+    for (const p of obj.properties) {
+      if (!p.name || !ts.isIdentifier(p.name)) continue;
+      const key = `${name}.${p.name.text}`;
+      if (ts.isMethodDeclaration(p) && p.body) this.localCallables.set(key, p);
+      else if (ts.isGetAccessor(p) && p.body) {
+        this.localCallables.set(key, p);
+        this.getters.add(key);
+      } else if (ts.isPropertyAssignment(p) && (ts.isArrowFunction(p.initializer) || ts.isFunctionExpression(p.initializer))) this.localCallables.set(key, p.initializer);
+    }
+  }
+
   private readonly deferredLocalExports: { localName: string; exported: string; line: number; typeOnly: boolean }[] = [];
 
   private addExport(name: string, kind: ExportKind, hoisted: boolean, node: ts.Node, declName: string): void {
-    const rec: ExportRecord = { name, kind, hoisted, line: this.pos(node).line, localName: declName, usesImports: [] };
+    const rec: ExportRecord = { name, kind, hoisted, ...this.span(node), localName: declName, usesImports: [] };
     this.exports.push(rec);
     const list = this.exportByDecl.get(declName) ?? [];
     list.push(rec);
@@ -430,6 +459,8 @@ class FileParser {
         kind: d.typeOnly ? 'type' : kind,
         hoisted: kind === 'function',
         line: this.topLevel[d.localName]?.line ?? d.line,
+        endLine: this.topLevel[d.localName]?.endLine,
+        endColumn: this.topLevel[d.localName]?.endColumn,
         localName: d.localName,
         usesImports: [],
       };
@@ -522,7 +553,7 @@ class FileParser {
   }
 
   private walk(node: ts.Node, ctx: WalkCtx): void {
-    if (ctx.footprint && this.walkFootprintControlFlow(node, ctx)) return;
+    if ((ctx.footprint || (ctx.timing === 'eager' && !ctx.typePos)) && this.walkControlFlow(node, ctx)) return;
     // Instantiation expression `Foo<string>` (TS 4.7+) is a value reference despite being a TypeNode.
     if (!ctx.typePos && ts.isExpressionWithTypeArguments(node) && !ts.isHeritageClause(node.parent)) {
       this.walk(node.expression, ctx);
@@ -545,6 +576,9 @@ class FileParser {
       case ts.SyntaxKind.PropertyAccessExpression: {
         const pa = node as ts.PropertyAccessExpression;
         if (ts.isIdentifier(pa.expression)) {
+          // reading a local getter at load time runs it
+          const getter = `${pa.expression.text}.${pa.name.text}`;
+          if (!ctx.footprint && ctx.timing === 'eager' && !ctx.typePos && this.getters.has(getter) && !this.isShadowed(pa.expression.text)) this.eagerInvoked.add(getter);
           this.onIdentifier(pa.expression, ctx, pa.name.text);
         } else {
           this.walk(pa.expression, ctx);
@@ -697,7 +731,14 @@ class FileParser {
       case ts.SyntaxKind.CaseBlock: {
         const declared = collectBlockDeclarations(node);
         if (declared.size > 0) this.scopes.push(declared);
-        ts.forEachChild(node, (child) => this.walk(child, ctx));
+        // After `if (cached) return x;` (or a conditional throw/break/continue) the rest of the block
+        // only runs when that exit was not taken.
+        let cur = ctx;
+        const branching = Boolean(ctx.footprint) || (ctx.timing === 'eager' && !ctx.typePos);
+        ts.forEachChild(node, (child) => {
+          this.walk(child, cur);
+          if (branching && cur === ctx && mayExitEarly(child)) cur = this.inBranch(ctx);
+        });
         if (declared.size > 0) this.scopes.pop();
         return;
       }
@@ -706,7 +747,8 @@ class FileParser {
         const declared = new Set<string>();
         if (cc.variableDeclaration) for (const n of bindingNames(cc.variableDeclaration.name)) declared.add(n);
         this.scopes.push(declared);
-        this.walk(cc.block, ctx);
+        // a catch block only runs when something threw
+        this.walk(cc.block, ctx.footprint || (ctx.timing === 'eager' && !ctx.typePos) ? this.inBranch(ctx) : ctx);
         this.scopes.pop();
         return;
       }
@@ -736,12 +778,19 @@ class FileParser {
     return true;
   }
 
+  /** The context for code that only runs if a condition holds: such a read is possible, not certain. */
+  private inBranch(ctx: WalkCtx): WalkCtx {
+    if (ctx.footprint) return { ...ctx, conditional: true };
+    return ctx.assumed ? ctx : { ...ctx, assumed: 'the read sits in a branch that may not run when the module loads' };
+  }
+
   /**
-   * Footprint mode: code in branches may not run on a given call (`if (lazy) return A;`), and a
-   * returned function only runs if the caller invokes the result (decorator factories do).
+   * Code in branches may not run (`if (lazy) return A;`, `isBrowser ? A : null`, `a ?? B`) – while
+   * a module loads just as on a call of a function. In footprint mode additionally: a returned
+   * function only runs if the caller invokes the result (decorator factories do).
    */
-  private walkFootprintControlFlow(node: ts.Node, ctx: WalkCtx): boolean {
-    const cond: WalkCtx = { ...ctx, conditional: true };
+  private walkControlFlow(node: ts.Node, ctx: WalkCtx): boolean {
+    const cond = this.inBranch(ctx);
     if (ts.isIfStatement(node)) {
       this.walk(node.expression, ctx);
       this.walk(node.thenStatement, cond);
@@ -765,11 +814,11 @@ class FileParser {
       }
       return false;
     }
-    if (ts.isCaseClause(node) || ts.isDefaultClause(node) || ts.isCatchClause(node)) {
+    if (ts.isCaseClause(node) || ts.isDefaultClause(node)) {
       ts.forEachChild(node, (child) => this.walk(child, cond));
       return true;
     }
-    if (ts.isReturnStatement(node) && node.expression && (ts.isArrowFunction(node.expression) || ts.isFunctionExpression(node.expression)) && !ctx.fpReturned) {
+    if (ctx.footprint && ts.isReturnStatement(node) && node.expression && (ts.isArrowFunction(node.expression) || ts.isFunctionExpression(node.expression)) && !ctx.fpReturned) {
       this.walkFunctionLike(node.expression, { ...ctx, fpReturned: true }, true);
       return true;
     }
@@ -975,9 +1024,11 @@ class FileParser {
         deps.locals.push(id.text);
       }
     }
+    // `ns.Member.method()` on a namespace import: a load-time call of a static method.
+    const method = member !== undefined && this.bindings.get(id.text)?.spec.imported === '*' ? staticCallOf(id) : undefined;
     if (ctx.footprint) {
       if (ctx.typePos || this.isShadowed(id.text)) return;
-      const ref = { line: this.pos(id).line, call: isInvoked(id, member !== undefined), conditional: ctx.conditional || undefined, assumed: ctx.assumed };
+      const ref = { line: this.pos(id).line, call: isInvoked(id, member !== undefined) || method !== undefined, conditional: ctx.conditional || undefined, assumed: ctx.assumed, method };
       const target = ctx.fpReturned ? ctx.footprint.returned : ctx.footprint;
       if (this.bindings.has(id.text)) target.imports.push({ local: id.text, member, ...ref });
       else if (this.topLevel[id.text]) target.locals.push({ name: id.text, member, ...ref });
@@ -1007,6 +1058,10 @@ class FileParser {
     if (ctx.decorator && !ctx.typePos) usage.decorator = ctx.decorator;
     if (ctx.property && !ctx.typePos) usage.property = ctx.property;
     if (!ctx.typePos && isInvoked(id, member !== undefined)) usage.call = true;
+    if (!ctx.typePos && method !== undefined) {
+      usage.call = true;
+      usage.staticCall = method;
+    }
     if (!ctx.typePos && isDecoratorFactoryCallee(id, member !== undefined)) usage.decoratorFactory = true;
     if (ctx.assumed && !ctx.typePos && timing === 'eager') usage.assumed = ctx.assumed;
     this.recordUsage(spec, usage);
@@ -1075,6 +1130,15 @@ class FileParser {
         declName: this.exportByDecl.has(name) ? name : undefined,
       };
       if (ts.isClassDeclaration(node)) {
+        // Instantiating a class also runs the constructor and field initialisers of its base class.
+        const base = baseClassOf(node);
+        if (base && !this.isShadowed(base.text)) {
+          if (this.localCallables.has(base.text)) this.eagerInvoked.add(base.text);
+          const imported = this.bindings.get(base.text);
+          const at = this.pos(base);
+          const usage = imported && this.usageIndex.get(imported.spec)?.get(`${at.line}:${at.column}`);
+          if (usage && usage.timing === 'eager') usage.call = true;
+        }
         this.scopes.push(new Set([name]));
         for (const member of node.members) {
           if (ts.isConstructorDeclaration(member)) this.walkFunctionLike(member, ctx, true);
@@ -1098,8 +1162,15 @@ class FileParser {
   private computeFootprints(): void {
     for (const [name, node] of this.localCallables) {
       const fp: Footprint = { line: this.pos(node).line, imports: [], locals: [], returned: { imports: [], locals: [] } };
+      if (this.getters.has(name)) fp.getter = true;
       const ctx: WalkCtx = { timing: 'eager', kind: 'top-level-call', desc: '', typePos: false, footprint: fp };
       if (ts.isClassDeclaration(node)) {
+        const base = baseClassOf(node);
+        if (base) {
+          const ref = { line: this.pos(base).line, call: true, inherit: true };
+          if (this.bindings.has(base.text)) fp.imports.push({ local: base.text, ...ref });
+          else if (this.topLevel[base.text]) fp.locals.push({ name: base.text, ...ref });
+        }
         this.scopes.push(new Set());
         for (const member of node.members) {
           const isStatic = ts.canHaveModifiers(member) && Boolean(ts.getModifiers(member)?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword));
@@ -1164,7 +1235,7 @@ class FileParser {
         const key = prop.name.text;
         if (key === 'providedIn') info.providedIn = exprText(prop.initializer, this.sf);
         if (ngDecorator?.name === 'Injectable' && (key === 'useClass' || key === 'useExisting' || key === 'useFactory' || key === 'deps')) {
-          const self = (info.selfProvider ??= { provide: info.name, line: this.pos(prop).line });
+          const self = (info.selfProvider ??= { provide: info.name, line: this.pos(prop).line, snippet: this.lineText(this.pos(prop).line) });
           this.applyProviderProp(self, key, prop.initializer);
         }
         if (key === 'providers' || key === 'viewProviders') this.collectProviders(prop.initializer, info.providers);
@@ -1225,7 +1296,7 @@ class FileParser {
       token = entityNameText(ref.typeName);
     }
     const { line, column } = this.pos(p);
-    return { token, line, column, via: 'constructor-param', flags };
+    return { token, line, column, via: 'constructor-param', flags, snippet: this.lineText(line) };
   }
 
   private collectInjectCalls(node: ts.Node, via: DiDependency['via'], out: DiDependency[]): void {
@@ -1247,7 +1318,7 @@ class FileParser {
             }
           }
           const { line, column } = this.pos(n);
-          out.push({ token, line, column, via, flags });
+          out.push({ token, line, column, via, flags, snippet: this.lineText(line) });
         }
       }
       ts.forEachChild(n, visit);
@@ -1263,7 +1334,7 @@ class FileParser {
         continue;
       }
       if (ts.isObjectLiteralExpression(el)) {
-        const info: ProviderInfo = { provide: '', line };
+        const info: ProviderInfo = { provide: '', line, snippet: this.lineText(line) };
         for (const prop of el.properties) {
           if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue;
           this.applyProviderProp(info, prop.name.text, prop.initializer);
@@ -1415,28 +1486,75 @@ const syncCallbackOf = (fn: ts.Node): { name: string; certain: boolean } | null 
     if (SYNC_CALLBACK_METHODS.has(name)) {
       if (name === 'from') {
         const recv = p.expression.expression;
-        return ts.isIdentifier(recv) && recv.text === 'Array' ? { name: 'Array.from()', certain: true } : null;
+        if (!ts.isIdentifier(recv) || recv.text !== 'Array') return null;
+        return { name: 'Array.from()', certain: p.arguments[0] !== undefined && hasElements(p.arguments[0], 1) };
       }
-      return { name: `.${name}()`, certain: isArrayExpression(p.expression.expression) };
+      // A comparator / reducer needs two elements to be called at all.
+      const needs = name === 'sort' || name === 'toSorted' || name === 'reduce' || name === 'reduceRight' ? 2 : 1;
+      return { name: `.${name}()`, certain: hasElements(p.expression.expression, needs) };
     }
   }
   if (ts.isNewExpression(p) && ts.isIdentifier(p.expression) && p.expression.text === 'Promise' && p.arguments?.[0] === fn) return { name: 'new Promise()', certain: true };
   return null;
 };
 
-/** Syntactically certain arrays: literals, Object.keys/values/entries, Array.from/of, and array-method chains on them. */
-const isArrayExpression = (e: ts.Expression): boolean => {
+/**
+ * Does the expression certainly evaluate to an array with at least `min` elements? Only then is a
+ * callback passed to `.map()` / `.forEach()` / `.sort()` certain to run: array literals,
+ * `Array.of(...)`, `{ length: n }` for `Array.from`, and length-preserving chains on them.
+ * `Object.keys(x)`, `.filter()` results or plain identifiers may be empty.
+ */
+const hasElements = (e: ts.Expression, min: number): boolean => {
   let cur = e;
   while (ts.isParenthesizedExpression(cur) || ts.isAsExpression(cur) || ts.isSatisfiesExpression(cur) || ts.isNonNullExpression(cur)) cur = cur.expression;
-  if (ts.isArrayLiteralExpression(cur)) return true;
+  if (ts.isArrayLiteralExpression(cur)) return cur.elements.filter((el) => !ts.isSpreadElement(el) && !ts.isOmittedExpression(el)).length >= min;
+  if (ts.isObjectLiteralExpression(cur)) {
+    // `Array.from({ length: 3 }, cb)`
+    const len = cur.properties.find((p) => ts.isPropertyAssignment(p) && ts.isIdentifier(p.name) && p.name.text === 'length');
+    return Boolean(len && ts.isPropertyAssignment(len) && ts.isNumericLiteral(len.initializer) && Number(len.initializer.text) >= min);
+  }
   if (ts.isCallExpression(cur) && ts.isPropertyAccessExpression(cur.expression)) {
     const recv = cur.expression.expression;
     const name = cur.expression.name.text;
-    if (ts.isIdentifier(recv) && recv.text === 'Object' && ['keys', 'values', 'entries', 'getOwnPropertyNames'].includes(name)) return true;
-    if (ts.isIdentifier(recv) && recv.text === 'Array' && (name === 'from' || name === 'of')) return true;
-    if (['map', 'filter', 'flatMap', 'slice', 'concat', 'toSorted', 'sort', 'reverse', 'flat'].includes(name)) return isArrayExpression(recv);
+    if (ts.isIdentifier(recv) && recv.text === 'Array' && name === 'of') return cur.arguments.filter((a) => !ts.isSpreadElement(a)).length >= min;
+    if (['map', 'toSorted', 'sort', 'reverse', 'toReversed', 'concat'].includes(name)) return hasElements(recv, min);
   }
   return false;
+};
+
+/** `class X extends Base` – the base class when it is a plain identifier. */
+const baseClassOf = (cls: ts.ClassLikeDeclaration): ts.Identifier | null => {
+  const expr = cls.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]?.expression;
+  return expr && ts.isIdentifier(expr) ? expr : null;
+};
+
+/** `ns.Member.method(...)`: returns `method` when the identifier `ns` starts such a call. */
+const staticCallOf = (id: ts.Identifier): string | undefined => {
+  const member = id.parent;
+  if (!member || !ts.isPropertyAccessExpression(member) || member.expression !== id) return undefined;
+  const method = member.parent;
+  if (!method || !ts.isPropertyAccessExpression(method) || method.expression !== member) return undefined;
+  const call = method.parent;
+  return call && ts.isCallExpression(call) && call.expression === method ? method.name.text : undefined;
+};
+
+/**
+ * Can this statement leave the enclosing block early on some runs – a `return`, `throw`, `break`
+ * or `continue` under a condition (not looking into nested functions)?
+ */
+const mayExitEarly = (stmt: ts.Node): boolean => {
+  if (!(ts.isIfStatement(stmt) || ts.isSwitchStatement(stmt) || ts.isTryStatement(stmt) || ts.isIterationStatement(stmt, false) || ts.isLabeledStatement(stmt) || ts.isBlock(stmt))) return false;
+  let found = false;
+  const visit = (n: ts.Node): void => {
+    if (found || ts.isFunctionLike(n) || ts.isClassLike(n)) return;
+    if (ts.isReturnStatement(n) || ts.isThrowStatement(n) || ts.isBreakStatement(n) || ts.isContinueStatement(n)) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(n, visit);
+  };
+  ts.forEachChild(stmt, visit);
+  return found;
 };
 
 /** `@Register('x')`: the identifier is the callee of a call that is itself the decorator expression. */

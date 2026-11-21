@@ -94,6 +94,7 @@ describe('cli', () => {
     expect(res.code).toBe(0);
     expect(res.stdout).not.toContain('INFO  Type-only');
     expect(res.stdout).not.toContain('Breaks in tests');
-    expect(res.stdout).toContain('MEDIUM  Order-dependent');
+    expect(res.stdout).toContain('LOW  Order-dependent');
+    expect(res.stdout).toContain('0 MEDIUM');
   });
 });

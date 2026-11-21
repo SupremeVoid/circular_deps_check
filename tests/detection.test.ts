@@ -162,7 +162,7 @@ describe('what the compiler actually emits', () => {
 });
 
 describe('order-dependent cycles are proven, not guessed', () => {
-  it('reports medium only with the concrete first-imported file that crashes', async () => {
+  it('reports low, with the concrete first-imported file that crashes', async () => {
     const r = await analyzeProject({
       'src/main.ts': `import './defaults';\n`,
       'src/defaults.ts': `import { Status } from './status';\nexport const DEFAULT = Status.On;\n`,
@@ -170,12 +170,13 @@ describe('order-dependent cycles are proven, not guessed', () => {
     });
     const m = r.findings.filter((f) => f.kind === 'latent-cycle');
     expect(m).toHaveLength(1);
+    expect(m[0]!.severity).toBe('low');
     expect(m[0]!.failures[0]!.state).toBe('undefined'); // enums are `var`-like
     expect(m[0]!.failures[0]!.entries).toEqual([{ entry: r.file('src/status.ts'), kind: 'hypothetical', chain: [r.file('src/status.ts'), r.file('src/defaults.ts')] }]);
     expect(r.stats.replayedOrders).toBe(2);
   });
 
-  it('reports one low finding per harmless group instead of one per cycle', async () => {
+  it('reports one info finding per harmless group instead of one per cycle', async () => {
     // a <-> b, b <-> c, a <-> c: three cycles, all deferred.
     const r = await analyzeProject({
       'src/main.ts': `import './a';\n`,
@@ -186,6 +187,7 @@ describe('order-dependent cycles are proven, not guessed', () => {
     expect(r.sccs[0]!.cycles.length).toBeGreaterThanOrEqual(3);
     const low = r.findings.filter((f) => f.kind === 'deferred-cycle');
     expect(low).toHaveLength(1);
+    expect(low[0]!.severity).toBe('info');
     expect(low[0]!.title).toContain('3 files');
   });
 });
@@ -411,10 +413,12 @@ describe('certainty: what is proven vs. possible', () => {
       'src/b.ts': `import { V } from './a';\nconst A = 1;\nexport function get(useA: boolean) { if (useA) return A; return 0; }\nexport const later = () => V;\n`,
     });
     expect(r.findings.filter((f) => f.severity === 'critical')).toHaveLength(0);
-    const m = r.findings.find((f) => f.kind === 'latent-cycle')!;
+    // reached when the app loads, but not provable: medium – the only thing medium is used for
+    const m = r.findings.find((f) => f.kind === 'possible-break')!;
     expect(m.severity).toBe('medium');
     expect(m.title).toStartWith('Possible crash');
     expect(m.failures[0]!.uncertain).toContain('branch of `get()`');
+    expect(m.failures[0]!.entries.map((e) => e.kind)).toEqual(['main']);
   });
 
   it('treats .map() on something that may not be an array as an assumption', async () => {
@@ -424,7 +428,8 @@ describe('certainty: what is proven vs. possible', () => {
       'src/b.ts': `import { o } from './a';\nexport class B { static n = 1; }\nexport const later = () => o;\n`,
     });
     expect(r.findings.filter((f) => f.severity === 'critical')).toHaveLength(0);
-    const m = r.findings.find((f) => f.kind === 'latent-cycle')!;
+    const m = r.findings.find((f) => f.kind === 'possible-break')!;
+    expect(m.severity).toBe('medium');
     expect(m.failures[0]!.uncertain).toContain('assumed to run immediately');
   });
 
@@ -503,8 +508,9 @@ describe('more load-time reads', () => {
     );
     // nothing from the real entry (the file is loaded first) …
     expect(r.findings.filter((f) => f.failures.some((fp) => fp.binding === 'API' && fp.entries.some((e) => e.kind === 'main')))).toHaveLength(0);
-    // … but a file of the cycle imported first (e.g. by a spec) still reads it too early
-    expect(r.findings.filter((f) => f.failures.some((fp) => fp.binding === 'API')).every((f) => f.severity === 'medium')).toBe(true);
+    // … but a file of the cycle imported first (e.g. by a spec) would still read it too early: order-dependent
+    const api = r.findings.filter((f) => f.failures.some((fp) => fp.binding === 'API'));
+    expect(api.map((f) => [f.kind, f.severity])).toEqual([['latent-cycle', 'low']]);
   });
 });
 

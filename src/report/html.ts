@@ -1,5 +1,5 @@
 import type { AnalysisResult } from '../types.js';
-import { toJsonReport } from './json.js';
+import { toJsonReport, type ReportOptions } from './json.js';
 
 /**
  * Self-contained HTML report (no external assets). All rendering happens client-side from the
@@ -9,8 +9,8 @@ import { toJsonReport } from './json.js';
  * the group's verified fix plan – usually resolves all of them. Each finding is a collapsible row
  * that expands into the evidence (failing line, call chain, load order, cycle diagram, fixes).
  */
-export const renderHtmlReport = (result: AnalysisResult, version: string): string => {
-  const data = toJsonReport(result, version);
+export const renderHtmlReport = (result: AnalysisResult, version: string, opts: ReportOptions = {}): string => {
+  const data = toJsonReport(result, version, opts);
   const json = JSON.stringify(data).replace(/<\/script/gi, '<\\/script').replace(/<!--/g, '<\\!--');
   const title = `Circular dependencies – ${data.root.split('/').pop() ?? data.root}`;
   return `<!doctype html>
@@ -81,6 +81,7 @@ main { padding: 18px 24px 64px; max-width: 1280px; margin: 0 auto; }
 .toolbar label { font-size: 12.5px; color: var(--muted); display: flex; gap: 5px; align-items: center; }
 .problem { background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--info); border-radius: 10px; margin-bottom: 14px; box-shadow: var(--shadow); overflow: hidden; }
 .problem.critical { border-left-color: var(--critical); } .problem.high { border-left-color: var(--high); } .problem.medium { border-left-color: var(--medium); } .problem.low { border-left-color: var(--low); }
+.problem.quiet { box-shadow: none; }
 .problem-head { padding: 12px 16px 10px; }
 .problem-head h2 { margin: 0; font-size: 15px; display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; }
 .problem-head .facts { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
@@ -97,6 +98,13 @@ main { padding: 18px 24px 64px; max-width: 1280px; margin: 0 auto; }
 .cut .act { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding-top: 2px; white-space: nowrap; }
 .cut .edge { font-weight: 600; overflow-wrap: anywhere; }
 .cut .why { grid-column: 2; color: var(--muted); }
+.cut .then { grid-column: 2; font-size: 12.5px; color: var(--muted); }
+.cut .then.next { color: var(--medium); font-weight: 600; }
+.cut .step { font-weight: 700; color: var(--muted); }
+.replay { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); font-size: 12.5px; color: var(--muted); }
+.replay.good b { color: var(--ok); } .replay.bad b { color: var(--medium); }
+.gate { font-size: 12.5px; margin: 2px 0; }
+.gate .who { color: var(--muted); }
 .rows { border-top: 1px solid var(--border); }
 details.row { border-bottom: 1px solid var(--border); }
 details.row:last-child { border-bottom: none; }
@@ -128,19 +136,40 @@ details.row[open] > summary .caret { transform: rotate(90deg); }
 .evidence { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 16px; align-items: start; }
 @media (max-width: 980px) { .evidence { grid-template-columns: minmax(0, 1fr); } }
 .evidence > * { min-width: 0; }
+.evidence.long { grid-template-columns: minmax(0, 1fr); }
 .tablewrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
 table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
 tr:last-child td { border-bottom: none; }
 th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; background: var(--panel-2); white-space: nowrap; }
 td.path { white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-td.syms { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; min-width: 120px; }
+td.syms { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; min-width: 220px; }
 td.where { color: var(--muted); min-width: 160px; }
 tr.fail td { background: color-mix(in srgb, var(--critical) 9%, transparent); }
 .tag { display: inline-block; padding: 0 6px; border-radius: 4px; font-size: 11px; font-weight: 600; border: 1px solid currentColor; white-space: nowrap; line-height: 1.5; }
 .tag.eager { color: var(--eager); } .tag.deferred { color: var(--deferred); } .tag.type, .tag.none { color: var(--type); } .tag.barrel { color: var(--barrel); } .tag.ok { color: var(--ok); }
 .diagram { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 6px; }
 .diagram svg { display: block; max-width: 100%; height: auto; margin: auto; }
+.diagram .hit { cursor: pointer; outline: none; }
+.diagram path.edge { transition: stroke-width .08s; }
+.diagram path.edge.hot { stroke-width: 4px; }
+.diagram .hint { font-size: 11.5px; color: var(--faint); margin-top: 4px; }
+#tip { position: fixed; z-index: 50; display: none; width: max-content; max-width: min(620px, calc(100vw - 16px)); background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.18), 0 1px 3px rgba(0,0,0,.12); padding: 10px 12px; font-size: 12.5px; pointer-events: none; }
+#tip.pinned { pointer-events: auto; border-color: var(--accent); }
+#tip .th { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; font-weight: 600; }
+#tip .tp { color: var(--muted); font-size: 11.5px; margin: 1px 0 6px; overflow-wrap: anywhere; }
+#tip .tc { background: var(--code); border: 1px solid var(--border); border-radius: 6px; padding: 4px 0; overflow-x: auto; }
+#tip .ln { display: grid; grid-template-columns: 38px minmax(0, 1fr); align-items: baseline; padding: 1px 8px 1px 0; }
+#tip .ln .no { text-align: right; padding-right: 8px; color: var(--faint); font-size: 11.5px; user-select: none; }
+#tip .ln a.no:hover { color: var(--accent); }
+#tip .ln pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+#tip .ln .nt { grid-column: 2; color: var(--muted); font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 11.5px; margin-bottom: 2px; }
+#tip .ln.fail { background: color-mix(in srgb, var(--critical) 10%, transparent); box-shadow: inset 3px 0 0 var(--critical); }
+#tip .ln.fail .nt { color: var(--critical); font-weight: 600; }
+#tip .ln.gap .no { color: var(--faint); }
+#tip .tf { color: var(--faint); font-size: 11.5px; margin-top: 6px; display: flex; justify-content: space-between; gap: 12px; }
+#tip .tf button { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0; font-size: 11.5px; }
 svg text { font-size: 11px; fill: var(--text); paint-order: stroke; stroke: var(--panel); stroke-width: 3px; stroke-linejoin: round; }
 svg .lbl { font-size: 10px; fill: var(--muted); }
 .legend { display: flex; gap: 4px 14px; flex-wrap: wrap; font-size: 11.5px; color: var(--muted); margin-top: 6px; }
@@ -165,7 +194,7 @@ details.more > summary { cursor: pointer; color: var(--accent); font-size: 12.5p
 .prose p, .prose li { max-width: 860px; }
 .edlink { font-size: 11.5px; white-space: nowrap; }
 .fc { display: flex; flex-direction: column; min-width: 0; }
-.fc .mono { white-space: nowrap; }
+.fc .mono { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 30ch; }
 .fc .dir { color: var(--faint); font-size: 11px; }
 td.syms .muted { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; overflow-wrap: normal; }
 .linkbtn { background: none; border: none; color: var(--accent); cursor: pointer; padding: 6px 0; font-size: 12.5px; }
@@ -177,7 +206,7 @@ const CLIENT_JS = String.raw`
   var data = JSON.parse(document.getElementById('report-data').textContent);
   var store = { get: function (k, d) { try { var v = localStorage.getItem('circdeps:' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
                 set: function (k, v) { try { localStorage.setItem('circdeps:' + k, JSON.stringify(v)); } catch (e) {} } };
-  var state = { tab: 'problems', sev: store.get('sev', { critical: true, high: true, medium: true, low: true, info: false }), q: '', editor: store.get('editor', true) };
+  var state = { tab: 'problems', sev: store.get('sev2', { critical: true, high: true, medium: true, low: true, info: false }), q: '', editor: data.editorLinks !== false && store.get('editor', true) };
   var app = document.getElementById('app');
   var SEV = ['critical', 'high', 'medium', 'low', 'info'];
   var RANK = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
@@ -227,15 +256,16 @@ const CLIENT_JS = String.raw`
       f.failures.map(function (fp) { return fp.symbol + ' ' + fp.binding + ' ' + fp.from; }).join(' ')].join(' ').toLowerCase();
     return hay.indexOf(q) !== -1;
   }
-  var KIND_LABEL = { 'runtime-break': 'crashes on app load', 'test-break': 'crashes in tests', 'latent-cycle': 'order-dependent', 'deferred-cycle': 'no load-time risk', 'di-cycle': 'DI cycle', 'type-only-cycle': 'type only' };
+  var KIND_LABEL = { 'runtime-break': 'crashes on app load', 'test-break': 'crashes in tests', 'possible-break': 'possible crash', 'latent-cycle': 'order-dependent', 'deferred-cycle': 'no load-time risk', 'di-cycle': 'DI cycle', 'type-only-cycle': 'type only' };
 
   // ------------------------------------------------------------------ ring diagram
   function ring(nodes, edges, failing) {
-    var n = nodes.length; var R = Math.max(90, Math.min(160, 60 + n * 14));
-    var W = 2 * (R + 175); var H = 2 * (R + 78);
+    var n = nodes.length; var R = Math.max(90, Math.min(190, 60 + n * 16));
+    var W = 2 * (R + 190); var H = 2 * (R + 78);
     var cx = W / 2, cy = H / 2; var pos = {};
     nodes.forEach(function (node, i) { var a = -Math.PI / 2 + (2 * Math.PI * i) / n; pos[node] = { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) }; });
-    var showAll = n <= 8;
+    // long cycles: only the failing imports are labelled – the popup has the rest
+    var showAll = n <= 5;
     function trunc(t, max) { return t.length > max ? t.slice(0, max - 1) + '…' : t; }
     function place(x, y) { var anchor = Math.abs(x - cx) < 14 ? 'middle' : x < cx ? 'end' : 'start'; var dy = Math.abs(x - cx) < 14 ? (y < cy ? -4 : 12) : 4; return { anchor: anchor, dy: dy }; }
     var colors = { eager: 'var(--eager)', deferred: 'var(--deferred)', type: 'var(--type)', none: 'var(--none)' };
@@ -245,7 +275,9 @@ const CLIENT_JS = String.raw`
       s += '<marker id="m-' + k + '" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="' + (k === 'fail' ? 'var(--critical)' : colors[k]) + '"/></marker>';
     });
     s += '</defs>';
-    edges.forEach(function (e) {
+    var hits = '';
+    var failCount = edges.filter(function (e) { return failing.some(function (f) { return f.from === e.from && f.to === e.to; }); }).length;
+    edges.forEach(function (e, ei) {
       var a = pos[e.from], b = pos[e.to]; if (!a || !b) return;
       var isFail = failing.some(function (f) { return f.from === e.from && f.to === e.to; });
       var col = isFail ? 'var(--critical)' : colors[e.usage] || colors.none;
@@ -258,11 +290,18 @@ const CLIENT_JS = String.raw`
       if (n === 2 || rl < 1) { ox = -uy; oy = ux; } else { ox = rx / rl; oy = ry / rl; }
       var bend = n === 2 ? 44 : Math.max(14, (R - rl) * 0.9);
       var cxp = mx + ox * bend, cyp = my + oy * bend;
-      s += '<path d="M' + x1 + ',' + y1 + ' Q' + cxp + ',' + cyp + ' ' + x2 + ',' + y2 + '" fill="none" stroke="' + col + '" stroke-width="' + (isFail ? 3 : e.usage === 'eager' ? 2 : 1.5) + '" ' + (e.usage === 'type' || e.usage === 'none' ? 'stroke-dasharray="4 3" ' : '') + 'marker-end="url(#m-' + (isFail ? 'fail' : (colors[e.usage] ? e.usage : 'none')) + ')"><title>' + esc(e.from + ' → ' + e.to + ' { ' + e.symbols.join(', ') + ' } ' + usageLabel(e.usage)) + '</title></path>';
-      if (!showAll && !isFail && e.usage !== 'eager') return;
+      var d = 'M' + x1 + ',' + y1 + ' Q' + cxp + ',' + cyp + ' ' + x2 + ',' + y2;
+      s += '<path class="edge" data-e="' + ei + '" d="' + d + '" fill="none" stroke="' + col + '" stroke-width="' + (isFail ? 3 : e.usage === 'eager' ? 2 : 1.5) + '" ' + (e.usage === 'type' || e.usage === 'none' ? 'stroke-dasharray="4 3" ' : '') + 'marker-end="url(#m-' + (isFail ? 'fail' : (colors[e.usage] ? e.usage : 'none')) + ')"></path>';
+      // wide transparent twin: an easy target for the code popup (hover, click or keyboard focus)
+      hits += '<path class="hit" data-e="' + ei + '" d="' + d + '" fill="none" stroke="transparent" stroke-width="18" tabindex="0" role="button" aria-label="' + esc('Show the code behind ' + e.from + ' importing ' + e.to) + '"></path>';
+      if (!showAll && (!isFail || failCount > 2)) return;
       var ax = (x1 + 2 * cxp + x2) / 4, ay = (y1 + 2 * cyp + y2) / 4;
       var lx = ax + ox * 10, ly = ay + oy * 10;
       var pl = place(lx, ly);
+      if (!showAll) {
+        lx = ax - ox * 14; ly = ay - oy * 14;
+        pl = { anchor: Math.abs(lx - cx) < 14 ? 'middle' : lx > cx ? 'end' : 'start', dy: 4 };
+      }
       var label = trunc(e.symbols.slice(0, 2).join(', ') + (e.symbols.length > 2 ? ' +' + (e.symbols.length - 2) : ''), 24);
       if (isFail) label = '⚡ ' + label;
       s += '<text class="lbl" x="' + lx + '" y="' + (ly + pl.dy) + '" text-anchor="' + pl.anchor + '" style="' + (isFail ? 'fill:var(--critical);font-weight:700' : '') + '"><title>' + esc(e.symbols.join(', ')) + '</title>' + esc(label) + '</text>';
@@ -274,10 +313,95 @@ const CLIENT_JS = String.raw`
       var nx = (p.x - cx) / R, ny = (p.y - cy) / R;
       var tx = p.x + nx * 44, ty = p.y + ny * 44;
       var np = place(tx, ty);
-      s += '<text class="node-lbl" x="' + tx + '" y="' + (ty + np.dy) + '" text-anchor="' + np.anchor + '" style="' + (isFailNode ? 'font-weight:700' : '') + '"><title>' + esc(node) + '</title>' + esc(trunc(/^index\.[cm]?tsx?$/.test(base(node)) ? short(node) : base(node), 28)) + '</text></g>';
+      s += '<text class="node-lbl" x="' + tx + '" y="' + (ty + np.dy) + '" text-anchor="' + np.anchor + '" style="' + (isFailNode ? 'font-weight:700' : '') + '"><title>' + esc(node) + '</title>' + esc(trunc((/^index\.[cm]?tsx?$/.test(base(node)) ? short(node) : base(node)).replace(/\.[cm]?tsx?$/, ''), np.anchor === 'middle' ? 36 : 24)) + '</text></g>';
     });
-    return s + '</svg>';
+    return s + hits + '</svg>';
   }
+
+  // ------------------------------------------------------------------ code popup on diagram edges
+  var tip = null, tipPinned = false, tipEdge = null;
+  function tipEl() {
+    if (!tip) { tip = document.createElement('div'); tip.id = 'tip'; tip.setAttribute('role', 'tooltip'); document.body.appendChild(tip); }
+    return tip;
+  }
+  function hideTip() {
+    if (tip) { tip.style.display = 'none'; tip.className = ''; }
+    tipPinned = false; tipEdge = null;
+    Array.prototype.forEach.call(document.querySelectorAll('path.edge.hot'), function (p) { p.classList.remove('hot'); });
+  }
+  /** The code behind one import: the import statement and the lines that use it, failing reads marked. */
+  function tipHtml(e, fails, pinned) {
+    var file = e.file || e.from;
+    var rows = {};
+    function row(line) { return rows[line] || (rows[line] = { line: line, code: '', notes: [], fail: false }); }
+    (e.imports || []).forEach(function (im) { var r = row(im.line); r.code = im.text; });
+    (e.uses || []).forEach(function (u) {
+      var r = row(u.line); if (u.snippet) r.code = u.snippet;
+      r.notes.push(u.timing === 'di' ? u.context : (u.timing === 'eager' ? 'runs at load time' : u.timing === 'deferred' ? 'runs later' : 'type only') + ' · ' + u.context);
+    });
+    fails.forEach(function (x) {
+      var r = row(x.line); if (x.snippet) r.code = x.snippet; r.fail = true;
+      var why = x.state === 'tdz' ? 'is not initialised yet → ReferenceError' : 'is still undefined here';
+      var when = x.entries && x.entries.length && x.entries[0].kind === 'hypothetical' ? ' if ' + base(x.entries[0].entry) + ' is imported first' : '';
+      r.notes = ['⚡ ' + (x.via && x.via.length ? x.symbol + '() reads ' + x.binding + ', which ' : x.binding + ' ') + why + when + (x.uncertain ? ' (possible)' : '')];
+    });
+    var list = Object.keys(rows).map(function (k) { return rows[k]; }).sort(function (a, b) { return a.line - b.line; });
+    var code = '', prev = 0;
+    list.forEach(function (r) {
+      if (prev && r.line > prev + 1) code += '<div class="ln gap"><span class="no">⋮</span><pre></pre></div>';
+      prev = r.line;
+      var no = pinned && state.editor ? '<a class="no" href="' + esc(editorUrl(file, r.line, 1)) + '" title="Open in VS Code">' + r.line + '</a>' : '<span class="no">' + r.line + '</span>';
+      code += '<div class="ln' + (r.fail ? ' fail' : '') + '">' + no + '<pre class="mono">' + esc(r.code) + '</pre>' + r.notes.map(function (n) { return '<span class="nt">' + md(n) + '</span>'; }).join('') + '</div>';
+    });
+    if (e.moreUses) code += '<div class="ln gap"><span class="no">⋮</span><span class="nt" style="grid-column:2">' + plural(e.moreUses, 'more line') + ' use this import</span></div>';
+    return '<div class="th"><span class="mono">' + esc(base(e.from)) + '</span><span class="muted" style="font-weight:400">' + (e.verb || 'imports') + '</span><span class="mono">' + esc(base(e.to)) + '</span>' +
+      (e.verb ? '' : usageTag(e.usage)) + (e.viaBarrel ? tag('barrel', 'barrel') : '') + '</div>' +
+      '<div class="tp mono">' + esc(file) + '</div>' +
+      (code ? '<div class="tc">' + code + '</div>' : '<div class="muted">No binding of this import is used – it only loads the file.</div>') +
+      '<div class="tf"><span>' + (pinned ? 'Esc or click elsewhere to close' : 'Click the arrow to keep this open') + '</span>' + (pinned ? '<button type="button" data-close="1">close</button>' : '') + '</div>';
+  }
+  function placeTip(x, y) {
+    var t = tipEl(); t.style.display = 'block';
+    var w = t.offsetWidth, hgt = t.offsetHeight, vw = window.innerWidth, vh = window.innerHeight;
+    var left = Math.max(8, Math.min(x + 14, vw - w - 8));
+    var top = y + 18; if (top + hgt > vh - 8) top = Math.max(8, y - hgt - 14);
+    t.style.left = left + 'px'; t.style.top = top + 'px';
+  }
+  /** Wire the edges of one diagram: hover shows the code, click or Enter pins the popup. */
+  function bindTips(box, edges, failures) {
+    function edgeOf(target) { var i = target && target.getAttribute && target.getAttribute('data-e'); return i == null ? null : edges[Number(i)]; }
+    function show(target, x, y, pinned) {
+      var e = edgeOf(target); if (!e) return;
+      var fails = failures.filter(function (f) { return f.from === e.from && f.to === e.to; });
+      var t = tipEl();
+      if (tipEdge !== e || pinned !== t.classList.contains('pinned')) { t.innerHTML = tipHtml(e, fails, pinned); t.className = pinned ? 'pinned' : ''; }
+      tipEdge = e; tipPinned = pinned;
+      Array.prototype.forEach.call(box.querySelectorAll('path.edge'), function (p) { p.classList.toggle('hot', p.getAttribute('data-e') === target.getAttribute('data-e')); });
+      placeTip(x, y);
+    }
+    function center(target) { var r = target.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; }
+    box.addEventListener('mousemove', function (ev) { if (!tipPinned && ev.target.classList && ev.target.classList.contains('hit')) show(ev.target, ev.clientX, ev.clientY, false); });
+    box.addEventListener('mouseout', function (ev) { if (!tipPinned && ev.target.classList && ev.target.classList.contains('hit')) hideTip(); });
+    box.addEventListener('click', function (ev) {
+      if (!ev.target.classList || !ev.target.classList.contains('hit')) return;
+      ev.stopPropagation();
+      if (tipPinned && tipEdge === edgeOf(ev.target)) { hideTip(); return; }
+      show(ev.target, ev.clientX, ev.clientY, true);
+    });
+    box.addEventListener('focusin', function (ev) { if (!tipPinned && ev.target.classList && ev.target.classList.contains('hit')) { var c = center(ev.target); show(ev.target, c.x, c.y, false); } });
+    box.addEventListener('focusout', function () { if (!tipPinned) hideTip(); });
+    box.addEventListener('keydown', function (ev) {
+      if ((ev.key === 'Enter' || ev.key === ' ') && ev.target.classList && ev.target.classList.contains('hit')) { ev.preventDefault(); var c = center(ev.target); show(ev.target, c.x, c.y, true); }
+    });
+  }
+  document.addEventListener('click', function (ev) {
+    if (!tipPinned) return;
+    if (tip && tip.contains(ev.target) && !(ev.target.getAttribute && ev.target.getAttribute('data-close'))) return;
+    hideTip();
+  });
+  document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') hideTip(); });
+  window.addEventListener('scroll', function () { if (!tipPinned) hideTip(); }, true);
+  var DIAGRAM_HINT = '<div class="hint">Hover an arrow to see the lines of code behind it; click to keep it open.</div>';
   var LEGEND = '<div class="legend"><span style="color:var(--critical)">breaking import</span><span style="color:var(--eager)">read at load time</span><span style="color:var(--deferred)">read later</span><span style="color:var(--type)">type only / no binding</span><span style="color:var(--barrel)">barrel file</span></div>';
 
   // ------------------------------------------------------------------ header, verdict, cards
@@ -294,26 +418,30 @@ const CLIENT_JS = String.raw`
   function renderVerdict() {
     var c = data.counts;
     var crashGroups = {}, cuts = 0, verified = true;
-    findings.forEach(function (f) { if (f.failures.length && f.sccId) crashGroups[f.sccId] = true; });
+    findings.forEach(function (f) { if (f.failures.length && f.sccId && RANK[f.severity] <= RANK.medium) crashGroups[f.sccId] = true; });
+    var fragile = findings.filter(function (f) { return f.kind === 'latent-cycle'; });
+    var fragileReads = fragile.reduce(function (n, f) { return n + f.failures.length; }, 0);
     Object.keys(crashGroups).forEach(function (id) { var p = planOf(Number(id)); if (p) { cuts += p.cuts.length; verified = verified && p.verified; } });
     var groups = Object.keys(crashGroups).length;
     var cls = c.critical ? 'bad' : c.high || c.medium ? 'warn' : 'good';
     var big = c.critical
       ? plural(c.critical, 'load-time crash', 'load-time crashes') + ' when the app (or a lazy route) loads'
       : c.high ? 'No crash on app load – but ' + plural(c.high, 'problem') + ' in tests or Angular DI'
-      : c.medium ? 'No crash today – ' + plural(c.medium, 'cycle') + ' crash under a different import order'
+      : c.medium ? 'No proven crash – ' + plural(c.medium, 'possible crash', 'possible crashes') + ' to check'
+      : fragile.length ? 'Nothing is broken in any current load order'
       : data.stats.sccs ? 'No crash under any import order' : 'No runtime import cycles';
-    var sub = groups ? 'Changing ' + plural(cuts, 'import') + ' ' + (verified ? '(verified) ' : '') + 'removes every cycle that can crash – see the fix at the top of each problem below.'
+    var sub = groups ? 'Changing ' + plural(cuts, 'import') + ' ' + (verified ? '(verified) ' : '') + 'removes every cycle that crashes today – see the fix at the top of each problem below.'
+      : fragile.length ? plural(fragileReads, 'load-time read') + ' in ' + plural(fragile.length, 'group') + ' depend' + (fragileReads === 1 ? 's' : '') + ' on today\'s import order (low). Nothing to fix now; untangle when you touch them.'
       : data.stats.sccs ? plural(data.stats.sccs, 'cyclic group') + ' remain, all safe at load time.' : '';
     if (!data.options.entries.length) sub = 'No entry point found – pass --entry src/main.ts so the app load order can be replayed. ' + sub;
     return h('div', { class: 'verdict ' + cls }, [h('div', {}, [h('div', { class: 'big' }, [big]), sub ? h('div', { class: 'sub' }, [sub]) : null])]);
   }
-  var SEV_DESC = { critical: 'crash on app load', high: 'test crash / DI cycle', medium: 'other import order', low: 'cycle, no crash', info: 'type-only, erased' };
+  var SEV_DESC = { critical: 'crash on app load', high: 'test crash / DI cycle', medium: 'possible crash', low: 'order-dependent, fine today', info: 'cannot crash' };
   function renderCards() {
     var wrap = h('div', { class: 'cards', role: 'group', 'aria-label': 'Filter by severity' });
     SEV.forEach(function (sev) {
       wrap.appendChild(h('button', { class: 'card ' + sev + (state.sev[sev] ? '' : ' off'), 'aria-pressed': String(state.sev[sev]), title: (state.sev[sev] ? 'Hide ' : 'Show ') + sev,
-        onclick: function () { state.sev[sev] = !state.sev[sev]; store.set('sev', state.sev); render(); } },
+        onclick: function () { state.sev[sev] = !state.sev[sev]; store.set('sev2', state.sev); render(); } },
         [h('div', { class: 'n' }, [String(data.counts[sev] || 0)]), h('div', { class: 'l' }, [sev]), h('div', { class: 'd' }, [SEV_DESC[sev]])]));
     });
     return wrap;
@@ -332,7 +460,7 @@ const CLIENT_JS = String.raw`
     var wrap = h('div');
     var tb = h('div', { class: 'toolbar' }, [
       h('input', { type: 'search', placeholder: 'Filter by file, symbol or text…', 'aria-label': 'Filter findings', value: state.q, oninput: function (e) { state.q = e.target.value; renderList(); } }),
-      h('label', {}, [h('input', { type: 'checkbox', onchange: function (e) { state.editor = e.target.checked; store.set('editor', state.editor); renderList(); } }), 'VS Code links'])
+      data.editorLinks === false ? null : h('label', {}, [h('input', { type: 'checkbox', onchange: function (e) { state.editor = e.target.checked; store.set('editor', state.editor); renderList(); } }), 'VS Code links'])
     ]);
     if (state.editor) tb.querySelector('input[type=checkbox]').checked = true;
     wrap.appendChild(tb);
@@ -365,23 +493,52 @@ const CLIENT_JS = String.raw`
   function countChips(list) {
     var counts = {};
     list.forEach(function (f) { counts[f.kind] = (counts[f.kind] || 0) + 1; });
-    return ['runtime-break', 'test-break', 'latent-cycle', 'deferred-cycle'].filter(function (k) { return counts[k]; }).map(function (k) {
-      var sev = k === 'runtime-break' ? 'critical' : k === 'test-break' ? 'high' : k === 'latent-cycle' ? 'medium' : 'low';
-      return '<span class="chip ' + sev + '">' + counts[k] + ' ' + esc(KIND_LABEL[k]) + '</span>';
+    var reads = 0;
+    list.forEach(function (f) { if (f.kind === 'latent-cycle') reads += f.failures.length; });
+    return ['runtime-break', 'test-break', 'possible-break', 'latent-cycle', 'deferred-cycle'].filter(function (k) { return counts[k]; }).map(function (k) {
+      var sev = k === 'runtime-break' ? 'critical' : k === 'test-break' ? 'high' : k === 'possible-break' ? 'medium' : k === 'latent-cycle' ? 'low' : '';
+      return '<span class="chip ' + sev + '">' + (k === 'latent-cycle' ? plural(reads, 'order-dependent read') : counts[k] + ' ' + esc(KIND_LABEL[k])) + '</span>';
     }).join(' ');
   }
 
   var ACTION = { 'rewire-barrel': 'Import directly', 'drop-reexport': 'Barrel re-export', 'move-code': 'Break import', 'remove-import': 'Remove import' };
+  function previewRef(x) {
+    var when = x.entryKind === 'test' ? 'in ' + esc(short(x.entry)) : x.entryKind === 'lazy' ? 'when ' + esc(short(x.entry)) + ' loads' : 'on app load';
+    return '<span class="mono">' + esc(short(x.from)) + ':' + x.line + '</span> reads <code>' + esc(x.binding) + '</code> too early ' + when + (x.uncertain ? ' (possible)' : '') +
+      (x.knownAs ? ' – ' + (x.knownKind === 'latent-cycle' ? 'today only order-dependent, ' : x.knownKind === 'test-break' ? 'today only in specs, ' : 'see ') + '<a href="#' + esc(x.knownAs) + '">' + esc(x.knownAs) + '</a>' : '');
+  }
   function fixBox(plan, total) {
     if (!plan || !plan.cuts.length) return null;
-    var cuts = plan.cuts.map(function (c) {
-      return '<div class="cut"><span class="act">' + esc(ACTION[c.action] || c.action) + '</span><span class="edge mono" title="' + esc(c.from + ' → ' + c.to) + '">' + esc(short(c.from)) + ' → ' + esc(short(c.to)) +
-        ' <span class="muted">{ ' + esc(c.symbols.slice(0, 4).join(', ')) + (c.symbols.length > 4 ? ', …' : '') + ' }</span></span><span class="why">' + md(c.reason) + '</span></div>';
+    var steps = plan.preview && plan.preview.simulated ? plan.preview.steps : [];
+    var done = {};
+    var cuts = plan.cuts.map(function (c, i) {
+      var then = '';
+      var st = steps[i];
+      if (st) {
+        var newly = st.resolved.filter(function (id) { return !done[id]; });
+        st.resolved.forEach(function (id) { done[id] = true; });
+        if (newly.length) then += '<span class="then">then: ' + newly.map(function (id) { return '<a href="#' + esc(id) + '">' + esc(id) + '</a>'; }).join(', ') + ' no longer crash' + (newly.length === 1 ? 'es' : '') + '</span>';
+        st.exposed.slice(0, 3).forEach(function (x) { then += '<span class="then next">then: next crash – ' + previewRef(x) + '</span>'; });
+        if (st.exposed.length > 3) then += '<span class="then next">… and ' + (st.exposed.length - 3) + ' more reads surface</span>';
+      }
+      return '<div class="cut"><span class="act">' + (plan.cuts.length > 1 ? '<span class="step">' + (i + 1) + '.</span> ' : '') + esc(ACTION[c.action] || c.action) + '</span><span class="edge mono" title="' + esc(c.from + ' → ' + c.to) + '">' + esc(short(c.from)) + ' → ' + esc(short(c.to)) +
+        ' <span class="muted">{ ' + esc(c.symbols.slice(0, 4).join(', ')) + (c.symbols.length > 4 ? ', …' : '') + ' }</span></span><span class="why">' + md(c.reason) + '</span>' + then + '</div>';
     }).join('');
     var title = plan.verified
       ? '✔ Fix: change ' + plural(plan.cuts.length, 'import') + ' – verified to make this group acyclic' + (total > 1 ? ', which resolves all ' + total + ' findings below' : '')
       : 'Suggested cuts (the group is still cyclic after these – see the findings)';
-    return h('div', { class: 'fixbox' + (plan.verified ? '' : ' unverified') }, [h('div', { class: 't' }, [title]), h('div', { html: cuts })]);
+    var replay = '';
+    var last = steps[plan.cuts.length - 1];
+    if (last) {
+      var left = last.remaining.length + last.exposed.length;
+      var scope = 'Replayed ' + plural(plan.preview.entries, 'entry point') + (plan.preview.skippedTests ? ' (app only, ' + plural(plan.preview.skippedTests, 'spec') + ' not replayed)' : '') + ' with ' + (plan.cuts.length === 1 ? 'this import gone' : 'all ' + plan.cuts.length + ' imports changed') + ': ';
+      replay = left === 0
+        ? '<div class="replay good">' + scope + '<b>' + (plan.preview.skippedTests ? 'no app-load crash left' : 'no crash left') + ' in this group, and none surfaces elsewhere.</b>' + (plan.cuts.length > 1 ? ' Applying only some of them changes the load order – the lines marked “next crash” show what would surface.' : '') + '</div>'
+        : '<div class="replay bad">' + scope + '<b>' + (left === 1 ? '1 read still fails' : left + ' reads still fail') + '</b> – e.g. ' + previewRef(last.exposed[0] || last.remaining[0]) + '.</div>';
+    } else if (plan.preview && !plan.preview.simulated) {
+      replay = '<div class="replay">Not replayed: ' + esc(plan.preview.reason) + '.</div>';
+    }
+    return h('div', { class: 'fixbox' + (plan.verified ? '' : ' unverified') }, [h('div', { class: 't' }, [title]), h('div', { html: cuts + replay })]);
   }
 
   function groupEdges(g) {
@@ -394,11 +551,12 @@ const CLIENT_JS = String.raw`
     var g = groupOf(id) || { files: [], barrels: [], cycles: [], edgeCount: 0 };
     var sev = worst(all);
     var el = h('section', { class: 'problem ' + sev, id: 'group-' + id });
-    var title = all.length === 1 && all[0].kind === 'deferred-cycle' ? 'Import cycle without load-time risk' : 'Import cycle group';
+    var title = all.length === 1 && all[0].kind === 'deferred-cycle' ? 'Import cycle without load-time risk' : all.length === 1 && all[0].kind === 'latent-cycle' ? 'Order-dependent import cycle – fine today' : 'Import cycle group';
+    if (RANK[sev] >= RANK.low) el.className += ' quiet';
     el.appendChild(h('div', { class: 'problem-head', html:
       '<h2><span class="badge ' + sev + '">' + sev + '</span> ' + esc(title) + ' <span class="muted" style="font-weight:400">#' + id + '</span> ' + countChips(all) + '</h2>' +
       '<div class="facts">' + plural(g.files.length, 'file') + ' · ' + plural(g.edgeCount, 'import') + (g.barrels.length ? ' · ' + plural(g.barrels.length, 'barrel') + ' (' + g.barrels.slice(0, 3).map(function (b) { return esc(short(b)); }).join(', ') + (g.barrels.length > 3 ? ', …' : '') + ')' : '') + ' · ' + plural(g.cycles.length, 'cycle') + (g.truncated ? '+' : '') + '</div>' }));
-    var fb = fixBox(planOf(id), all.filter(function (f) { return f.failures.length; }).length);
+    var fb = fixBox(planOf(id), all.length);
     if (fb) el.appendChild(fb);
     var rows = h('div', { class: 'rows' });
     shown.forEach(function (f) { rows.appendChild(findingRow(f, shown.length === 1)); });
@@ -431,11 +589,13 @@ const CLIENT_JS = String.raw`
 
   function triggerText(f) {
     if (!f.failures.length) return f.kind === 'deferred-cycle' ? 'safe in every order' : '';
+    if (f.kind === 'latent-cycle') return 'only under another import order';
     var kinds = {}, tests = 0, hyp = null;
     f.failures.forEach(function (fp) { fp.entries.forEach(function (e) { kinds[e.kind] = (kinds[e.kind] || 0) + 1; if (e.kind === 'test') tests++; if (e.kind === 'hypothetical' && !hyp) hyp = e.entry; }); });
-    if (kinds.main) return 'on app load' + (tests ? ' · ' + plural(tests, 'spec') : '');
-    if (kinds.lazy) return 'when the lazy route loads';
-    if (tests) return 'in ' + plural(tests, 'spec');
+    var maybe = f.kind === 'possible-break' ? 'possibly ' : '';
+    if (kinds.main) return maybe + 'on app load' + (tests ? ' · ' + plural(tests, 'spec') : '');
+    if (kinds.lazy) return maybe + 'when the lazy route loads';
+    if (tests) return maybe + 'in ' + plural(tests, 'spec');
     if (hyp) return 'if ' + base(hyp) + ' loads first';
     return '';
   }
@@ -444,10 +604,12 @@ const CLIENT_JS = String.raw`
     var d = h('details', { class: 'row', id: f.id });
     if (open) d.open = true;
     var fp = f.failures[0];
-    var what = fp
+    var what = f.kind === 'latent-cycle'
+      ? plural(f.failures.length, 'load-time read') + ' that ' + (f.failures.length === 1 ? 'relies' : 'rely') + ' on today\'s import order'
+      : fp
       ? (fp.via ? '<code>' + esc(fp.symbol) + '()</code> reads <code>' + esc(fp.binding) + '</code> too early' : '<code>' + esc(fp.symbol) + '</code> read too early')
       : f.kind === 'deferred-cycle' ? md(f.title.replace(/: \d+ files \(group #\d+\)$/, '')) : md(f.title);
-    var where = fp ? ' <span class="where mono">' + esc(short(fp.from)) + ':' + fp.line + '</span>' : '';
+    var where = fp && f.kind !== 'latent-cycle' ? ' <span class="where mono">' + esc(short(fp.from)) + ':' + fp.line + '</span>' : '';
     d.appendChild(h('summary', { html: '<span><span class="caret">▸</span> <span class="badge ' + f.severity + '">' + f.severity + '</span></span><span class="what">' + what + where + '</span><span class="trig">' + esc(triggerText(f)) + '</span>' }));
     var body = null;
     d.addEventListener('toggle', function () { if (d.open && !body) { body = findingDetail(f); d.appendChild(body); } });
@@ -480,7 +642,29 @@ const CLIENT_JS = String.raw`
     var el = h('div', { class: 'detail' });
     el.appendChild(h('div', { class: 'summary', html: md(f.summary) }));
 
-    if (f.failures.length) {
+    if (f.kind === 'latent-cycle') {
+      var gates = f.enteredThrough || [];
+      el.appendChild(h('div', { class: 'st' }, ['Why nothing breaks today']));
+      el.appendChild(h('div', { html: gates.length
+        ? '<div class="muted" style="font-size:12.5px;margin-bottom:4px">The first file of a cyclic group to be imported fixes the order of all the others. Every current entry point enters this group through:</div>' + gates.slice(0, 6).map(function (g) {
+            var who = [g.main ? 'app start' : '', g.lazy ? plural(g.lazy, 'lazy chunk') : '', g.test ? plural(g.test, 'spec') : ''].filter(Boolean).join(', ');
+            return '<div class="gate">' + loc(g.file) + ' <span class="who">– ' + esc(who) + '</span></div>';
+          }).join('') + (gates.length > 6 ? '<div class="muted">… ' + (gates.length - 6) + ' more files</div>' : '')
+        : '<div class="muted">No current entry point loads these files.</div>' }));
+      el.appendChild(h('div', { class: 'st' }, ['Reads that would break under another order (' + f.failures.length + ')']));
+      var rowsHtml = function (n) {
+        return '<div class="tablewrap"><table><thead><tr><th>Read at load time</th><th>Needs</th><th>Breaks if this is imported first</th></tr></thead><tbody>' + f.failures.slice(0, n).map(function (x) {
+          var more = (x.triggerCount || x.entries.length) - 1;
+          var first = x.entries[0];
+          return '<tr><td>' + loc(x.from, x.line, x.column) + '<div class="mono muted" style="font-size:11.5px;overflow-wrap:anywhere">' + esc(x.snippet) + '</div></td>' +
+            '<td class="syms"><code>' + esc(x.binding) + '</code><div class="muted">' + esc(x.originKind) + ' in ' + esc(short(x.originPath || x.to)) + (x.via && x.via.length ? ', read inside ' + esc(x.symbol) + '()' : '') + (x.uncertain ? ' · not certain: ' + md(x.uncertain) : '') + '</div></td>' +
+            '<td>' + (first ? fileCell(first.entry) : '') + (more > 0 ? '<span class="muted" style="font-size:11.5px">or ' + plural(more, 'other file') + ' of the group</span>' : '') + '</td></tr>';
+        }).join('') + '</tbody></table></div>';
+      };
+      var tbl = h('div', { html: rowsHtml(12) });
+      el.appendChild(tbl);
+      if (f.failures.length > 12) el.appendChild(h('button', { class: 'linkbtn', onclick: function (e) { tbl.innerHTML = rowsHtml(f.failures.length); e.target.remove(); } }, ['Show all ' + f.failures.length + ' reads']));
+    } else if (f.failures.length) {
       el.appendChild(h('div', { class: 'st' }, ['Where it breaks']));
       el.appendChild(h('div', { html: f.failures.slice(0, 3).map(failureBlock).join('') }));
       if (f.failures.length > 3) el.appendChild(h('div', { class: 'muted' }, ['… ' + (f.failures.length - 3) + ' more reads on the same import']));
@@ -503,10 +687,13 @@ const CLIENT_JS = String.raw`
     }
 
     if (f.cycle && f.cycle.nodes.length) {
-      var failing = f.failures.map(function (x) { return { from: x.from, to: x.to }; });
-      el.appendChild(h('div', { class: 'st' }, ['The cycle (' + plural(f.cycle.nodes.length, 'file') + ')']));
-      var ev = h('div', { class: 'evidence' });
-      ev.appendChild(h('div', { class: 'diagram', html: ring(f.cycle.nodes, f.cycle.edges, failing) + LEGEND }));
+      var failing = f.failures.slice();
+      if (f.kind === 'latent-cycle') failing = failing.filter(function (x) { return f.cycle.edges.some(function (e) { return e.from === x.from && e.to === x.to; }); });
+      el.appendChild(h('div', { class: 'st' }, [(f.kind === 'latent-cycle' ? 'One of the cycles (' : 'The cycle (') + plural(f.cycle.nodes.length, 'file') + ')']));
+      var ev = h('div', { class: 'evidence' + (f.cycle.nodes.length > 5 ? ' long' : '') });
+      var dia = h('div', { class: 'diagram', html: ring(f.cycle.nodes, f.cycle.edges, failing) + LEGEND + DIAGRAM_HINT });
+      bindTips(dia, f.cycle.edges, failing);
+      ev.appendChild(dia);
       ev.appendChild(h('div', { class: 'tablewrap', html: '<table><thead><tr><th>File</th><th>imports</th><th>Use</th><th>Symbols · where</th></tr></thead><tbody>' + f.cycle.edges.map(function (e) {
         var isFail = failing.some(function (x) { return x.from === e.from && x.to === e.to; });
         var where = e.sample && e.usage !== 'none' ? '<div class="muted" style="font-size:11.5px">' + md(e.sample.context) + ' · L' + e.sample.line + '</div>' : '';
@@ -544,8 +731,14 @@ const CLIENT_JS = String.raw`
     body.appendChild(h('div', { class: 'summary', html: md(f.summary) }));
     var ev = h('div', { class: 'evidence' });
     var names = f.di.nodes.map(function (n) { return n.name; });
-    var edges = f.di.edges.map(function (e, i) { return { from: names[i], to: names[(i + 1) % names.length], usage: 'eager', symbols: [e.via], viaBarrel: false }; });
-    ev.appendChild(h('div', { class: 'diagram', html: ring(names, edges, []) }));
+    var edges = f.di.edges.map(function (e, i) {
+      var how = e.via + (e.flags.length ? ' (' + e.flags.map(function (x) { return '@' + x; }).join(' ') + ')' : '');
+      return { from: names[i], to: names[(i + 1) % names.length], file: e.path, verb: 'needs', usage: 'eager', symbols: [e.via], viaBarrel: false, imports: [],
+        uses: [{ line: e.line, snippet: e.snippet || '', timing: 'di', context: 'injected while \x60' + names[i] + '\x60 is being constructed (' + how + ')' }] };
+    });
+    var dia = h('div', { class: 'diagram', html: ring(names, edges, []) + DIAGRAM_HINT });
+    bindTips(dia, edges, []);
+    ev.appendChild(dia);
     ev.appendChild(h('div', { class: 'tablewrap', html: '<table><thead><tr><th>Needs</th><th>Where</th><th>How</th></tr></thead><tbody>' + f.di.edges.map(function (e) {
       return '<tr><td><b>' + esc(e.from) + '</b> → <b>' + esc(e.to) + '</b></td><td>' + loc(e.path, e.line) + '</td><td>' + esc(e.via) + (e.flags.length ? ' (' + e.flags.map(function (x) { return '@' + x; }).join(' ') + ')' : '') + '</td></tr>';
     }).join('') + '</tbody></table>' }));
@@ -584,13 +777,15 @@ const CLIENT_JS = String.raw`
   function renderHowto() {
     return h('div', { class: 'prose', html: [
       '<h3>What this report shows</h3>',
-      '<p>An import cycle only breaks when a module <em>reads</em> a binding from a module that has not finished loading. The tool replays the ES-module load order – from <code>main.ts</code>, every lazy route chunk, every spec file, and once more with every file of each cycle imported first – and reports exactly those reads.</p>',
+      '<p>An import cycle only breaks when a module <em>reads</em> a binding from a module that has not finished loading. The tool replays the ES-module load order – from <code>main.ts</code>, every lazy route chunk on its own (as if the user deep-linked to it) and every spec file – and reports exactly those reads. Severity says how real the problem is <em>today</em>.</p>',
       '<h3>Severities</h3>',
       '<ul><li><b>Critical</b> – crashes when the app (or a lazy route) loads: <code>ReferenceError: Cannot access X before initialization</code> under native ESM / Vite / vitest, or an <code>undefined</code> value after bundling (<code>Class extends value undefined</code>, <code>Invalid provider … undefined</code>).</li>',
       '<li><b>High</b> – crashes only when a spec file is the entry (“works in the app, fails in tests”), and Angular DI cycles (NG0200).</li>',
-      '<li><b>Medium</b> – proven to crash when another file of the cycle is imported first. Today\'s entry points happen to load it in a safe order; a new spec, feature or barrel reorder can flip it.</li>',
-      '<li><b>Low</b> – a group of files that import each other, replayed in every order without a crash (reads only happen inside functions, or target hoisted functions). One finding per group.</li>',
-      '<li><b>Info</b> – files that reference each other only as types. The compiler erases these imports.</li></ul>',
+      '<li><b>Medium</b> – a <em>possible</em> crash on a real load path: the read is reached when the app or a spec loads, but whether it runs depends on something the analysis cannot prove (a branch, a callback assumed to run synchronously, a file outside the analysed set). The reason is shown – check it.</li>',
+      '<li><b>Low</b> – order-dependent: nothing breaks in any current load order. The group is replayed once more with each of its files imported first; the reads that would fail in one of those orders are listed, together with the files through which today\'s entry points enter the group. Good to know before you reorder imports or add a spec; not a bug. One finding per group.</li>',
+      '<li><b>Info</b> – cycles that cannot crash: reads only happen inside functions or target hoisted functions (replayed in every order), or the files reference each other only as types, which the compiler erases.</li></ul>',
+      '<h3>Why a new finding can appear after a fix</h3>',
+      '<p>Changing an import changes the load order, and a read that was safe can become the next crash. Such reads are the <em>order-dependent</em> ones (low). To take the surprise out, each fix plan is replayed: the entry points are loaded again with the plan applied one change at a time, and a line “then: next crash – …” names what would surface after that step. “No crash left, none surfaces elsewhere” means the full plan was replayed clean.</p>',
       '<h3>Problems = cyclic groups</h3>',
       '<p>Files that can all reach each other form a group. One group usually produces several findings, and one change usually fixes all of them, so findings are grouped and the <b>verified fix</b> (the fewest imports to change so the group becomes acyclic) is shown first. Barrel imports are rewired to the files that declare the symbols, and the plan is only marked verified when the rewired graph is acyclic.</p>',
       '<h3>Read at load time vs. later</h3>',
@@ -605,6 +800,7 @@ const CLIENT_JS = String.raw`
   }
 
   function render() {
+    hideTip();
     app.innerHTML = '';
     app.appendChild(renderHeader());
     var main = h('main');
@@ -615,11 +811,14 @@ const CLIENT_JS = String.raw`
     app.appendChild(main);
   }
   render();
-  if (location.hash) {
+  function openHash() {
+    if (!location.hash) return;
     var id = decodeURIComponent(location.hash.slice(1));
     var target = document.getElementById(id);
     if (target && target.tagName === 'DETAILS') target.open = true;
     if (target) target.scrollIntoView();
   }
+  openHash();
+  window.addEventListener('hashchange', openHash);
 })();
 `;

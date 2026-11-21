@@ -3,7 +3,7 @@ export type { AnalyzeProgress } from './analyze.js';
 export { resolveConfig, type CircdepsOptions, type ResolvedConfig } from './config.js';
 export { renderTextReport, type TextReportOptions } from './report/text.js';
 export { renderHtmlReport } from './report/html.js';
-export { toJsonReport, type JsonReport, type JsonFinding } from './report/json.js';
+export { toJsonReport, type JsonReport, type JsonFinding, type ReportOptions } from './report/json.js';
 export { parseModule, type ParseContext } from './parser.js';
 export { buildGraph, resolveExport, runtimeEdges, edgeSymbols } from './graph.js';
 export { ModuleResolver } from './resolver.js';

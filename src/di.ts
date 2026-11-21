@@ -146,7 +146,7 @@ export const buildDiGraph = (graph: ModuleGraph): DiGraph => {
   };
 
   const buildProvider = (p: ProviderInfo, mod: ModuleInfo, providedId: string, scope: string, scopeName?: string): void => {
-    const dep = (token: string, flags: DiDependencyFlags = {}): DiDependency => ({ token, line: p.line, column: 0, via: 'provider', flags });
+    const dep = (token: string, flags: DiDependencyFlags = {}): DiDependency => ({ token, line: p.line, column: 0, via: 'provider', flags, snippet: p.snippet });
     if (p.useClass) {
       const target = resolveToken(graph, mod, p.useClass, cache);
       if (classes.has(target.id)) {

@@ -30,6 +30,8 @@ export interface CircdepsOptions {
   angular?: boolean;
   /** Report type-only cycles as info findings (default true, hidden in text output). */
   reportTypeOnly?: boolean;
+  /** Replay the entry points with each fix plan applied to show what is left and what surfaces next (default true). */
+  fixPreview?: boolean;
 }
 
 export interface ResolvedConfig {
@@ -49,6 +51,7 @@ export interface ResolvedConfig {
   isolatedModules: boolean;
   angular: boolean;
   reportTypeOnly: boolean;
+  fixPreview: boolean;
 }
 
 export const DEFAULT_EXCLUDE = [
@@ -146,6 +149,7 @@ export const resolveConfig = (opts: CircdepsOptions): ResolvedConfig => {
     ),
     angular: merged.angular ?? true,
     reportTypeOnly: merged.reportTypeOnly ?? true,
+    fixPreview: merged.fixPreview ?? true,
   };
 };
 

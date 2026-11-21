@@ -77,20 +77,20 @@ describe('large generated project (fixtures/05-large-generated)', () => {
     expect(result.diCycles).toHaveLength(1);
   });
 
-  it('finds the planted order-dependent enum/const pair as medium', () => {
+  it('finds the planted order-dependent enum/const pair as low', () => {
     const p = planted.cycles['latent']!;
     const f = result.findings.find((x) => x.kind === 'latent-cycle' && cycleHas(x, p.files![0]!))!;
     expect(f).toBeDefined();
-    expect(f.severity).toBe('medium');
+    expect(f.severity).toBe('low');
     for (const file of p.files!) expect(cycleHas(f, file)).toBe(true);
     expect(f.suggestions.some((s) => s.kind === 'move-symbol' && s.verified)).toBe(true);
   });
 
-  it('finds the planted deferred-only service pair as low', () => {
+  it('finds the planted deferred-only service pair as info', () => {
     const p = planted.cycles['deferred']!;
     const f = result.findings.find((x) => x.kind === 'deferred-cycle' && cycleHas(x, p.files![0]!))!;
     expect(f).toBeDefined();
-    expect(f.severity).toBe('low');
+    expect(f.severity).toBe('info');
     for (const file of p.files!) expect(cycleHas(f, file)).toBe(true);
   });
 

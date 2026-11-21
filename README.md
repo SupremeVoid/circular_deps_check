@@ -1,139 +1,166 @@
 # circular-deps-check (`circdeps`)
 
-A circular-dependency checker for large TypeScript / Angular code bases that reports **the cycles that
-actually break** and pinpoints **the exact edge, symbol and line** where they break.
+Finds the import cycles in a TypeScript / Angular project that **actually break** – and shows the
+exact line, the load order that leads to it, and a fix that has already been tried out for you.
 
-Most cycle detectors (madge, dpdm, skott, dependency-cruiser, `import/no-cycle`) print every cycle in
-the file graph and leave you with hundreds of entries, most of which are harmless, plus the standard
-non-advice "use `import type`". `circdeps` instead answers three questions:
+<p align="center">
+  <a href="https://supremevoid.github.io/circular_deps_check/sample-report/"><img src="docs/img/report-overview.png" width="760" alt="HTML report of the sample shop app: four load-time crashes, each group with its verified fix"></a>
+</p>
 
-1. **Which cycles crash at load time?** It replays the ECMAScript module evaluation order from your
-   entry points (`main.ts`, every lazy route chunk, every `*.spec.ts`) and finds every *eager* read of a
-   binding whose module has not finished initialising – the reads that throw
-   `ReferenceError: Cannot access 'X' before initialization` or leave `X` undefined
-   (`Class extends value undefined`, `Invalid provider … undefined`).
-2. **Which cycles are Angular DI cycles?** Services/components that need each other during
-   construction (`constructor(private b: B)`, `inject(B)`, `useExisting`, factory `deps`) → NG0200.
-3. **Which cycles are order-dependent, deferred-only or purely type-level?** So you can prioritise.
+**[Check this sample report →](https://supremevoid.github.io/circular_deps_check/sample-report/)** –
+the live report of a small shop app (65 components) with cycles of 2 to 8 files. Hover the arrows.
 
-Every finding comes with the evaluation chain, the failing source line, and **graph-verified fix
-suggestions** (direct imports instead of barrels, symbol extraction traced through the symbol's own
-imports, `forwardRef`, lazy routes, `emitDecoratorMetadata`).
-
-## Install / run
+## Quick start
 
 ```bash
 bun install
-bun run src/cli.ts /path/to/angular-project
-# or after `bun run build`:
-node bin/circdeps.js /path/to/angular-project
+bun run src/cli.ts /path/to/your/project
 ```
 
-Reports are written to `./reports/circular-deps.{txt,html,json}`; the terminal shows the critical,
-high and medium findings. The HTML report is a single self-contained file (works offline, dark mode).
+Then open `reports/circular-deps.html`. The terminal prints what is broken (or may be) and one line
+about the rest; `reports/` also gets a `.txt` and a `.json` version.
+
+Without Bun at run time: `bun run build` once, then `node bin/circdeps.js /path/to/your/project`.
+
+In CI the command exits with code 1 when something is broken (see `--fail-on`).
+
+## What it tells you
+
+| Severity | Meaning | What to do |
+| --- | --- | --- |
+| **critical** | Crashes when the app or a lazy route loads. | Fix. |
+| **high** | Crashes when a spec file loads; Angular DI cycle (NG0200); a value that is silently `undefined` on app load. | Fix. |
+| **medium** | *Possible* crash on a real load path: the read is reached, but it sits in a branch or callback the tool cannot prove runs. The reason is shown. | Check. |
+| **low** | *Order-dependent.* Works in every load order your project uses today; would break if another file of the cycle were imported first. One entry per group of files. | Nothing now – good to know before you reorder imports there. |
+| **info** | A cycle that cannot crash (the imports are only used inside functions, or only as types). | Nothing. |
+
+Severity says how real a problem is **today**. A cycle that works in every current load order is
+never more than low.
+
+## The report
+
+Files that can all reach each other form a *group*. One group usually causes several findings and
+one change usually fixes all of them, so each group starts with its **fix** and lists the findings
+below it.
+
+### The code behind every arrow
+
+Open a finding to see the failing line, the load order from your entry point, and the cycle as a
+diagram. Hover an arrow to see the import statement and the lines that use it – the failing read
+is marked. Click the arrow to keep the popup open; the line numbers then open the file in VS Code.
+
+<p align="center">
+  <img src="docs/img/report-code-popup.png" width="720" alt="A cycle of eight files that only crashes when one spec loads: load order, diagram, and a popup with the import statement and the failing line">
+</p>
+
+### What happens after the fix
+
+Changing an import changes the order in which files load, so a line that was fine can become the
+next crash. To take that surprise out, every fix is replayed: your entry points are loaded again
+with the fix applied one change at a time.
+
+```
+✔ fix (verified, 2 imports):
+  ✂ orders/order-list.component.ts → shared/index.ts { formatDate }  import { formatDate } from '../../shared/util/format' instead of the barrel
+      then: next crash – shared/widgets/table-presets.ts:4 reads `OrderRowComponent` too early when orders.routes.ts loads – today only order-dependent, C10
+  ✂ orders/order-row.component.ts → shared/index.ts { ROW_PRESET }  …
+      then: C2 no longer crashes
+  replayed 1 entry point with all 2 imports changed: no crash left in this group, none surfaces elsewhere
+```
+
+A "next crash" line names what would surface if you stopped after that step.
+
+### Order-dependent cycles
+
+A low finding lists the reads that depend on the import order, which file would have to be imported
+first to break them, and why that does not happen today.
+
+<p align="center">
+  <img src="docs/img/report-order-dependent.png" width="720" alt="Order-dependent finding: why nothing breaks today and which reads would break under another import order">
+</p>
+
+## Options
 
 ```
 circdeps [root] [options]
-  --tsconfig <path>        tsconfig used for path aliases (auto-detected)
-  --include <glob>         files to analyze (repeatable, default **/*.{ts,tsx,mts,cts})
-  --exclude <glob>         files to skip (repeatable)
-  --entry <path|glob>      application entry point(s) (default: src/main.ts)
-  --test-entry <glob>      test entry glob(s) (default: **/*.spec.ts)
-  --no-tests               skip test entries
-  --out <dir>              report directory (default ./reports)
-  --format text,html,json  which reports to write
-  --fail-on <severity>     exit 1 at this severity or worse (default: high; `none` never fails)
-  --max-cycles <n>         cycles enumerated per cyclic group (default 200)
-  --verbose / --quiet / --json / --no-color / --no-angular / --emit-decorator-metadata
 ```
 
-A `circdeps.config.json` in the project root accepts the same keys as the JS API (`include`,
-`exclude`, `entries`, `testEntries`, `noTestEntries`, `maxCyclesPerScc`, `reportTypeOnly`, …).
+| Option | Purpose | Default |
+| --- | --- | --- |
+| `--entry <path\|glob>` | App entry point(s), repeatable | `src/main.ts` |
+| `--test-entry <glob>` | Spec files, each loaded on its own | `**/*.spec.ts` |
+| `--no-tests` | Ignore spec files | |
+| `--include` / `--exclude <glob>` | Files to analyse, repeatable | all `.ts` files |
+| `--tsconfig <path>` | tsconfig used for path aliases | auto-detected |
+| `--out <dir>` | Where the reports go | `./reports` |
+| `--display-root <text>` | Show this instead of the project path on your machine (for reports you publish or attach in CI) | |
+| `--format text,html,json` | Which reports to write | all three |
+| `--fail-on <severity>` | Exit 1 at this severity or worse (`none` never fails) | `high` |
+| `--no-fix-preview` | Skip replaying the fixes (faster) | |
+| `--verbose` / `--quiet` | Print everything / only the summary | |
+| `--json` | Print the JSON report to stdout | |
+| `--no-angular` | Skip the Angular DI analysis | |
 
-## Reading the report
+Run `circdeps --help` for the full list. The same settings can live in a `circdeps.config.json`
+in the project root (`entries`, `testEntries`, `include`, `exclude`, `fixPreview`, …).
 
-Findings are grouped into **problems**: a problem is a cyclic group (files that can all reach each
-other). One group usually causes several findings and one change usually fixes all of them, so every
-problem starts with its **verified fix** – the fewest imports to change so the group becomes acyclic –
-followed by one collapsible row per finding (failing line, call chain, load order, cycle diagram,
-fixes). The text report starts with the same "Problems – fix these first" overview.
-
-| Severity | Meaning |
-| --- | --- |
-| **critical** | A read of an uninitialised binding when the app or a lazy route loads. Crashes. |
-| **high** | The same, but only when a spec file is the entry ("works in the app, fails in tests"); Angular DI cycles (NG0200); a value that is silently `undefined` on app load. |
-| **medium** | Proven to crash when another file of the cycle is imported first (the group is replayed with every member as the first import), or a *possible* crash that depends on something the analysis cannot prove (a branch, an assumed synchronous callback, a file outside the analysed set). The reason is shown. |
-| **low** | One finding per cyclic group that was replayed in every order without a crash. Works, but the next top-level use breaks it. |
-| **info** | Type-only cycles. The compiler erases these imports; nothing happens at runtime. |
-
-## How the analysis works
-
-1. **Parse** every file with the TypeScript compiler API (no type-check; ~1 s for 70k lines). Every
-   reference to an imported binding is classified as
-   *load time* (top-level code, `extends`, decorator arguments such as `@Component({ imports, providers })`,
-   static fields, enum initialisers, callbacks of `.map()`/`.forEach()`/`new Promise()`, functions,
-   static methods and classes invoked while the module loads),
-   *later* (function/method/constructor bodies, instance fields, `inject()`, arrow functions, `forwardRef`),
-   or *type* (annotations, `implements`, generics, `import type`). Per top-level function the parser
-   also records a *footprint* – what it reads when called – so load-time calls can be followed across
-   files.
-2. **What the compiler emits** decides which imports exist at runtime: unused and type-only imports
-   are erased; Angular constructor parameter types are kept (ngtsc references them in the generated
-   factory, including `X | null`); `emitDecoratorMetadata` only adds reads for non-Angular decorators
-   (ngtsc strips Angular decorators first); `const enum` imports are erased only without
-   `isolatedModules`; type-only `export { T } from` and `import x = require()` are erased like tsc does.
-3. **Load-order replay** follows the ES-module algorithm: depth-first in import order, a module body
-   runs once all its imports are done or still loading. At that moment every load-time read is
-   checked against the declaring file (through barrels and `export *`): `class`/`const`/`let` →
-   TDZ `ReferenceError`, `var`/`enum`/`namespace` → `undefined`, `function` declarations → always
-   initialised – unless the called function itself reads something that has not run yet. Entries:
-   `main.ts`, every lazy `import()` chunk, every spec file in isolation, and every file of each cyclic
-   group as a hypothetical first import (proves or refutes order-dependent cycles).
-4. **Never guess**: bindings from packages or unresolvable re-exports never produce a certain finding;
-   files outside the analysed set are opaque modules whose load *time* is known, so reading their
-   re-exports before they load is reported as a possible crash.
-5. **Cycles and fix plans**: Tarjan SCCs, shortest cycle per edge plus bounded Johnson enumeration,
-   greedy feedback-arc-set per group. A barrel import is rewired to the declaring files (as you would
-   fix it) and the plan is only "verified" when the rewired graph is acyclic.
-6. **DI graph**: injectables, components, directives, pipes, NgModules and `InjectionToken`s with
-   constructor parameters, `inject()` (fields, constructor, parameter defaults, `useFactory`,
-   token factories), inherited dependencies, `useClass`/`useExisting`/`deps` (with
-   `[new Optional(), new SkipSelf(), X]` flags), root-level providers (`app.config.ts`) and
-   component-scoped injectors (a root service cannot see a component's providers).
-
-## Programmatic API
+Use it from code:
 
 ```ts
-import { analyze, renderTextReport, renderHtmlReport, toJsonReport } from 'circular-deps-check';
+import { analyze } from 'circular-deps-check';
 
 const result = await analyze({ root: '/my/app', entries: ['src/main.ts'] });
 for (const f of result.findings) console.log(f.severity, f.title);
 ```
 
+## How it works
+
+An import cycle only breaks when a file *reads* something from a file that has not finished loading.
+So instead of listing cycles, the tool loads your project the way the browser or the test runner
+would – on paper:
+
+1. **Read every file** and note, for each import, whether it is used while the file loads (top-level
+   code, `extends`, decorator arguments like `@Component({ imports })`, static fields), only later
+   (inside functions, constructors, `inject()`), or only as a type. It follows what the compiler
+   emits: type-only imports disappear, Angular constructor parameter types stay.
+2. **Replay the load order** from every real starting point: `main.ts`, each lazy route on its own
+   (as if a user opened that URL directly), and each spec file on its own. Every load-time read of
+   something not yet initialised is a finding – with the line, the chain of files and the cycle.
+   Calls into other files at load time are followed.
+3. **Replay each group once more with every file imported first.** Reads that only fail there are
+   the order-dependent ones (low).
+4. **Find Angular DI cycles**: services and components that need each other while being constructed.
+5. **Plan and replay a fix** for every group: the fewest imports to change so the group is no longer
+   cyclic, then the entry points again with those changes applied.
+
+Nothing is guessed: what cannot be proven is reported as *possible* with the reason, or not at all.
+
+## Good to know
+
+- Spec files are loaded one at a time with nothing else loaded, as Vitest and Jest do. Karma loads
+  all specs together, where a spec that fails alone may pass. Test setup files are not replayed.
+- A read inside a branch (`if`, `?:`, `&&`, `??`, after an early `return`) or in a callback of an
+  array that may be empty is reported as *possible*, even if it always runs in practice.
+- Callbacks handed to your own functions (`once(() => A)`), `fn.call()` and methods called on a
+  fresh instance (`new Svc().get()`) are not followed, so a load-time read hidden there is missed.
+- The fix replay shows the plan as written: the listed imports are gone or point at the declaring
+  file. A fix that only defers a read (`forwardRef`, moving the access into a function) keeps the
+  load order and helps only when that read is the failing one.
+- Top-level `await import()` is treated like any lazy import. Angular `NgModule` remote scoping
+  (NG3003) is not modelled.
+
 ## Development
 
 ```bash
-bun test              # unit + end-to-end tests (fixtures/01-04, detection precision suites) + performance test (generated 3k-file project)
+bun test              # unit and end-to-end tests, including a generated 3,000-file project
 bun run typecheck
 bun run build         # emits dist/ for the node CLI in bin/
 bun run gen:fixtures  # regenerate fixtures/05-large-generated
 ```
 
-Fixtures under `fixtures/` document every supported pattern: barrels, path aliases, mutual standalone
-components, lazy routes, DI cycles, enum/const pairs, hoisted functions, `emitDecoratorMetadata`.
-`fixtures/05-large-generated` is a deterministic 3,000-file Angular-style project (seeded generator,
-`planted.json` lists the seven planted cycle groups); the perf test analyses it, including 557 spec
-entries and 10 lazy chunks, in about one second on a laptop.
-
-## Known limitations
-
-- A higher-order function from another file that invokes a callback it receives
-  (`run(() => A.n)`), and methods called on a fresh instance (`new Svc().get()`), are not followed.
-- Footprints only include code that runs directly when a function is called; reads inside branches are
-  reported as possible crashes, not certain ones.
-- Top-level `await import()` is treated like any dynamic import (a lazy chunk).
-- Spec files are replayed with a fresh module registry each (vitest/jest behaviour). Karma loads all
-  specs into one registry, where the order of spec files decides which test-only crashes occur.
-- Scope analysis is syntactic (parameters and block-level declarations); exotic shadowing may hide a usage.
-- Angular `NgModule` remote scoping (NG3003) is not modelled; standalone components are analysed as
-  the compiler emits them.
+`fixtures/` holds one small project per pattern (barrels, path aliases, lazy routes, DI cycles,
+`emitDecoratorMetadata`, a fix that changes the load order) and `07-shop-app`, a shop with 65
+components and every kind of finding. The screenshots and the sample report come from that app;
+`bun run sample:report` rebuilds `docs/sample-report/`, which GitHub Pages serves. Detection
+changes are checked against real ES-module execution; `tests/audit.test.ts` keeps the cases that
+found a mistake.

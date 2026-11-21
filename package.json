@@ -1,6 +1,6 @@
 {
   "name": "circular-deps-check",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Circular dependency checker for TypeScript/Angular projects that finds the cycles that actually break at runtime and pinpoints the exact failing edge.",
   "type": "module",
   "license": "MIT",
@@ -18,6 +18,7 @@
   "files": [
     "dist",
     "bin",
+    "docs",
     "README.md"
   ],
   "engines": {
@@ -30,6 +31,7 @@
     "test:watch": "bun test --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "gen:fixtures": "bun run scripts/generate-large-fixture.ts",
+    "sample:report": "bun run scripts/build-sample-report.ts",
     "check:self": "bun run src/cli.ts . --include \"src/**/*.ts\" --no-tests"
   },
   "dependencies": {

@@ -182,6 +182,32 @@ export const moveSymbolSuggestion = (ctx: SuggestContext, edge: GraphEdge, onlyS
   };
 };
 
+/**
+ * Project files the symbols imported over `edge` import themselves (following local helpers they
+ * use), in source order – what a new file holding those symbols would still load.
+ */
+export const movedSymbolDependencies = (ctx: SuggestContext, edge: GraphEdge): string[] => {
+  const deps: string[] = [];
+  for (const s of edgeSymbolOrigins(ctx, edge)) {
+    const originMod = s.origin ? ctx.graph.modules.get(s.origin.originPath) : undefined;
+    if (!s.origin || !originMod) continue;
+    const imports = new Set<string>(s.origin.record.usesImports);
+    const queue = [s.origin.record.localName ?? s.symbol];
+    const seenLocals = new Set(queue);
+    while (queue.length > 0) {
+      const d = originMod.declDeps[queue.pop()!];
+      if (!d) continue;
+      for (const i of d.imports) imports.add(i);
+      for (const l of d.locals) if (!seenLocals.has(l)) { seenLocals.add(l); queue.push(l); }
+    }
+    for (const r of originMod.imports) {
+      if (r.erased || r.kind === 'dynamic' || !r.resolvedPath || r.external || !ctx.graph.modules.has(r.resolvedPath)) continue;
+      if (r.specifiers.some((sp) => imports.has(sp.local)) && !deps.includes(r.resolvedPath)) deps.push(r.resolvedPath);
+    }
+  }
+  return deps;
+};
+
 /** Converting a static route reference into a lazy `loadComponent` removes the import edge entirely. */
 const lazyRouteSuggestion = (ctx: SuggestContext, edge: GraphEdge): Suggestion | null => {
   for (const r of edge.records) {

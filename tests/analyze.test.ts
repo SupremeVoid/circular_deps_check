@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { analyzeFixture, cycleFiles, endsWith, findingsOfKind } from './helpers.js';
+import { countBySeverity } from '../src/index.js';
 
 describe('fixture 01-basic', () => {
   it('reports the load-time crash reachable from main as critical with the exact failing usage', async () => {
@@ -54,11 +55,11 @@ describe('fixture 01-basic', () => {
     expect(extendsEdge.deferredCount).toBe(1);
   });
 
-  it('classifies deferred-only and hoisted-function cycles as low', async () => {
+  it('classifies deferred-only and hoisted-function cycles as info (they cannot crash in any order)', async () => {
     const r = await analyzeFixture('01-basic');
     const low = findingsOfKind(r, 'deferred-cycle');
     expect(low).toHaveLength(2);
-    expect(low.every((f) => f.severity === 'low')).toBe(true);
+    expect(low.every((f) => f.severity === 'info')).toBe(true);
     const files = low.map((f) => cycleFiles(f).sort().join('+')).sort();
     expect(files).toEqual(['services/a.service.ts+services/b.service.ts', 'utils/constants.ts+utils/format.ts']);
     const hoisted = low.find((f) => cycleFiles(f).some((x) => x.endsWith('format.ts')))!;
@@ -76,7 +77,7 @@ describe('fixture 01-basic', () => {
     expect(r.stats.erasedEdges).toBe(2);
     expect(r.stats.sccs).toBe(4);
     expect(r.stats.typeOnlyCycles).toBe(1);
-    expect(r.findings.map((f) => f.severity)).toEqual(['critical', 'high', 'low', 'low', 'info']);
+    expect(r.findings.map((f) => f.severity)).toEqual(['critical', 'high', 'info', 'info', 'info']);
   });
 
   it('produces a verified fix plan for every group', async () => {
@@ -185,15 +186,20 @@ describe('fixture 03-angular-app', () => {
     expect(r.diCycles).toHaveLength(1);
   });
 
-  it('proves order-dependent crashes (medium) by replaying the group with each file imported first', async () => {
+  it('reports order-dependent reads as low – one finding per group, proven by replaying each file as first import', async () => {
     const r = await analyzeFixture('03-angular-app');
     const latent = findingsOfKind(r, 'latent-cycle');
-    expect(latent.every((f) => f.severity === 'medium')).toBe(true);
+    expect(latent.every((f) => f.severity === 'low')).toBe(true);
     const enumPair = latent.find((f) => cycleFiles(f).some((x) => x.endsWith('status.enum.ts')))!;
     expect(cycleFiles(enumPair).sort()).toEqual(['models/defaults.ts', 'models/status.enum.ts']);
     expect(enumPair.failures[0]!.symbol).toBe('Status');
     expect(enumPair.failures[0]!.entries.map((e) => `${e.kind}:${e.entry.split('/').pop()}`)).toEqual(['hypothetical:status.enum.ts']);
-    expect(enumPair.summary).toContain('if `src/app/shared/models/status.enum.ts` is the first file of this cycle to be imported');
+    expect(enumPair.failures[0]!.triggerCount).toBe(1);
+    expect(enumPair.title).toContain("relies on today's import order");
+    expect(enumPair.summary).toStartWith('Not a problem today');
+    expect(enumPair.summary).toContain('if `src/app/shared/models/status.enum.ts` is the first file of the group to be imported');
+    // … and why it does not happen: every real entry reaches the pair through defaults.ts first
+    expect(enumPair.enteredThrough!.map((g) => [g.file.split('/').pop(), g.main, g.test])).toEqual([['defaults.ts', 1, 1]]);
     expect(enumPair.suggestions.some((s) => s.kind === 'move-symbol' && s.verified)).toBe(true);
     // The mirror direction of each crash is a separate failure point: fixing only one side leaves it.
     const mirrorTree = latent.find((f) => f.failures[0]!.symbol === 'TreeNodeComponent')!;
@@ -226,9 +232,76 @@ describe('fixture 03-angular-app', () => {
 
   it('orders findings by severity and assigns sequential ids', async () => {
     const r = await analyzeFixture('03-angular-app');
-    expect(r.findings.map((f) => f.severity)).toEqual(['critical', 'critical', 'high', 'medium', 'medium', 'medium', 'low']);
+    expect(r.findings.map((f) => f.severity)).toEqual(['critical', 'critical', 'high', 'low', 'low', 'low', 'info']);
     expect(r.findings.map((f) => f.id)).toEqual(['C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7']);
     expect(r.stats.replayedOrders).toBe(8);
+  });
+});
+
+describe('fixture 06-fix-order', () => {
+  it('names the read that becomes the next crash after the first change of the fix', async () => {
+    const r = await analyzeFixture('06-fix-order');
+    expect(r.findings.map((f) => [f.kind, f.severity])).toEqual([
+      ['runtime-break', 'critical'],
+      ['latent-cycle', 'low'],
+    ]);
+    const steps = r.fixPlans[0]!.preview!.steps;
+    expect(steps[0]!.resolved).toEqual(['C1']);
+    expect(steps[0]!.exposed.map((x) => `${x.from.split('/').pop()}:${x.line} ${x.binding} ${x.knownAs}`)).toEqual(['theme.ts:5 Panel C2']);
+    expect(steps[1]!.exposed).toEqual([]);
+    expect(steps[1]!.remaining).toEqual([]);
+  });
+
+  it('carries the code behind every edge of a cycle: import statement and the lines using it', async () => {
+    const r = await analyzeFixture('06-fix-order');
+    const note = r.findings[0]!.edgeNotes.find((n) => endsWith(n.from, 'shared/widget.ts'))!;
+    expect(note.imports).toEqual([{ line: 1, text: "import { Feature } from '../feature';" }]);
+    expect(note.uses.map((u) => [u.line, u.timing, u.snippet])).toEqual([[6, 'eager', 'static owner = Feature.name;']]);
+    expect(note.moreUses).toBe(0);
+    const barrel = r.findings[0]!.edgeNotes.find((n) => endsWith(n.from, 'shared/index.ts'))!;
+    expect(barrel.imports.map((i) => i.text)).toEqual(["export * from './widget';"]);
+    expect(barrel.uses).toEqual([]);
+  });
+});
+
+describe('fixture 07-shop-app (the published sample)', () => {
+  const short = (p: string): string => p.split('/').slice(-1)[0]!;
+
+  it('has every kind of finding, with chains of 2 to 8 files', async () => {
+    const r = await analyzeFixture('07-shop-app');
+    expect(r.stats.files).toBeGreaterThan(95);
+    expect([...r.graph.modules.keys()].filter((p) => p.endsWith('.component.ts')).length).toBeGreaterThanOrEqual(60);
+    expect(countBySeverity(r.findings)).toEqual({ critical: 4, high: 2, medium: 1, low: 6, info: 3 });
+    const crash = (file: string) => r.findings.find((f) => (f.kind === 'runtime-break' || f.kind === 'test-break') && f.failures.some((fp) => short(fp.from) === file))!;
+    // app start: a constant living in a component file, read at the end of a chain of six files
+    const header = crash('layout-metrics.ts');
+    expect([header.severity, header.cycle!.nodes.length]).toEqual(['critical', 6]);
+    expect(header.failures[0]!.entries[0]!.chain.map(short).slice(-6)).toEqual(['header.component.ts', 'nav-menu.component.ts', 'navigation.ts', 'feature-flags.ts', 'app-settings.ts', 'layout-metrics.ts']);
+    // lazy routes, each found when loaded on its own
+    expect(crash('admin-widgets.ts').failures[0]!.entries.map((e) => `${e.kind}:${short(e.entry)}`)).toEqual(['lazy:admin.routes.ts']);
+    expect(crash('recent-orders.component.ts').failures[0]!.entries.map((e) => `${e.kind}:${short(e.entry)}`)).toEqual(['lazy:orders.routes.ts']);
+    expect(crash('category-node.component.ts').cycle!.nodes).toHaveLength(2);
+    // a wizard of eight files: fine in the app, crashes when the spec of one step loads first
+    const wizard = crash('shipping-options.component.ts');
+    expect([wizard.kind, wizard.severity, wizard.cycle!.nodes.length]).toEqual(['test-break', 'high', 8]);
+    expect(wizard.failures[0]!.entries[0]!.chain).toHaveLength(9);
+    expect(r.findings.filter((f) => f.kind === 'di-cycle').map((f) => f.diCycle!.nodes.map((n) => n.name).sort())).toEqual([['CartService', 'CouponService']]);
+    expect(r.findings.find((f) => f.kind === 'possible-break')!.failures[0]!.uncertain).toContain('branch');
+  });
+
+  it('plans the easy cut and shows what the first change of a two-step fix would surface', async () => {
+    const r = await analyzeFixture('07-shop-app');
+    const planOf = (file: string) => r.fixPlans.find((p) => p.cuts.some((c) => short(c.from) === file))!;
+    // the constant can simply move out of the component file
+    const header = planOf('layout-metrics.ts');
+    expect(header.cuts.map((c) => [short(c.from), short(c.to), c.reason.includes('move the symbol into a file that does not import back')])).toEqual([['layout-metrics.ts', 'header.component.ts', true]]);
+    const orders = planOf('order-list.component.ts');
+    expect(orders.cuts.map((c) => c.action)).toEqual(['rewire-barrel', 'move-code']);
+    expect(orders.preview!.steps[0]!.exposed.map((x) => `${short(x.from)}:${x.line} ${x.binding} ${x.entryKind}`)).toEqual(['table-presets.ts:4 OrderRowComponent lazy']);
+    expect(orders.preview!.steps[1]!.exposed).toEqual([]);
+    expect(orders.preview!.steps[1]!.remaining).toEqual([]);
+    // recursive components: forwardRef is the fix
+    expect(planOf('category-node.component.ts').cuts[0]!.reason).toContain('forwardRef');
   });
 });
 
